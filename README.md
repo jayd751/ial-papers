@@ -30,11 +30,22 @@ Your browser opens. Then you click to download papers.
 
 ## Use it
 
-Download tab. Pick subject, units, years and paper type. Click download.
+Close server. The top right button stops the local server when you are done. Python is only running while the window is open.
 
 Library tab. See what you downloaded. Sort and delete. Untick a paper to download it again.
 
 Setup tab. Pick the subjects and units you take. Then downloads stay inside your setup.
+
+Planner tab. Works out how many past papers you need and spreads them across the weeks before the exam.
+
+- Pick subject and units, then the paper pool: new spec only, new plus legacy, or a fixed number.
+- Set your current grade and target grade. Each grade of gap asks for more papers per unit.
+- Set the start date, exam date, sessions per week and minutes per session.
+- It builds a calendar: papers in date order alternating units, a review every two papers, and the newest paper of each unit as a timed mock at the end.
+- Tick sessions off as you do them. Plan and ticks are saved in `plan.json`.
+- Download .ics to put the plan in your calendar.
+
+The maths, briefly. Grade gap of 0 asks 2 papers per unit, then 4, 6, 8, 10 for gaps of 1 to 4. Each two papers is followed by a review session, which is the spacing. Sessions are spread evenly across the whole run-up rather than bunched at the start. If the sessions do not fit the weeks left, it says so and tells you how many per week would fit.
 
 ## Where files go
 

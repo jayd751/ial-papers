@@ -17,13 +17,19 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 OUT_ROOT = os.path.join(HERE, "papers")
 SETTINGS_FILE = os.path.join(HERE, "settings.json")
 FORCE_FILE = os.path.join(HERE, "force.json")
+PLAN_FILE = os.path.join(HERE, "plan.json")
 PORT = 8000
-YEAR_MIN, YEAR_MAX = 2003, 2025
+YEAR_MIN, YEAR_MAX = 2003, 2026  # YEAR_MAX must track the newest year in the index
 
+SERVER = None  # set in __main__, used by the Close server button
 JOBS = {}
 _JOB_SEQ = 0
 _UNIT_CACHE = {}
 
+# NOTE: this is a normal Python string, so backslashes are escapes. Inside the
+# JavaScript below, write \\r\\n and \\d, never \r\n or \d. A single \r becomes a
+# real carriage return and takes the whole script tag down with it, which is
+# exactly what happened once already.
 HTML = """<!doctype html>
 <html lang="en">
 <head>
@@ -48,8 +54,14 @@ HTML = """<!doctype html>
   .headrow { display:flex; justify-content:space-between; align-items:center; }
   header h1 { margin:0; font-size:1.15rem; }
   header h1 span { color:var(--gold-l); }
-  #theme { background:var(--panel2); color:var(--fg); border:1px solid var(--line);
+  .headbtns { display:flex; gap:.4rem; }
+  #theme, #closeserver { background:var(--panel2); color:var(--fg); border:1px solid var(--line);
        padding:.45rem .8rem; border-radius:8px; cursor:pointer; font:inherit; font-size:.85rem; }
+  #closeserver { color:#ffb3ad; border-color:#6b2b2b; }
+  #closeserver:hover { background:#3a1515; }
+  .stopped { max-width:520px; margin:4rem auto; background:var(--panel); border:1px solid var(--line);
+             border-radius:12px; padding:2rem; text-align:center; }
+  .stopped h2 { margin-top:0; }
   nav { display:flex; gap:.4rem; margin-top:.7rem; }
   nav button { background:var(--panel2); color:var(--mut); border:1px solid var(--line);
        padding:.5rem 1rem; font:inherit; border-radius:8px 8px 0 0; cursor:pointer; }
@@ -116,18 +128,49 @@ HTML = """<!doctype html>
   .toggle { display:flex; align-items:center; gap:.6rem; margin:1rem 0; }
   .toggle input { width:18px; height:18px; accent-color:var(--gold); }
   a { color:var(--blue); }
+  /* ---- study planner ---- */
+  .pcal { display: flex; flex-direction: column; gap: .35rem; margin-top: .8rem; }
+  .pweek { display: grid; grid-template-columns: 70px repeat(7, minmax(0, 1fr)); gap: .35rem; }
+  .pweek .plabel { font-size: .72rem; color: var(--mut); padding-top: .4rem; }
+  .pday { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
+          min-height: 62px; padding: .3rem; font-size: .72rem; color: var(--mut); }
+  .pday.today { border-color: var(--gold-l); }
+  .pday .dnum { font-size: .68rem; opacity: .7; }
+  .ptask { margin-top: .25rem; padding: .28rem .35rem; border-radius: 6px; font-size: .7rem;
+           line-height: 1.25; background: var(--panel); border: 1px solid var(--line);
+           color: var(--fg); cursor: pointer; }
+  .ptask.done { opacity: .45; text-decoration: line-through; }
+  .ptask.paper { border-left: 3px solid #58a6ff; }
+  .ptask.review { border-left: 3px solid #3fb950; }
+  .ptask.mock { border-left: 3px solid #d29922; }
+  .ptask b { font-weight: 600; }
+  .ptask .sub { display: block; font-size: .64rem; color: var(--mut); }
+  .pcal-toolbar { display: flex; align-items: center; gap: .6rem; flex-wrap: wrap; }
+  .pstat { display: grid; grid-template-columns: repeat(auto-fit, minmax(110px, 1fr)); gap: .5rem; margin: .6rem 0; }
+  .pstat div { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; padding: .5rem .6rem; }
+  .pstat b { display: block; font-size: 1.15rem; }
+  .pstat span { font-size: .7rem; color: var(--mut); }
+  .warn { border-left: 3px solid #d29922; background: var(--panel2); padding: .5rem .7rem;
+          border-radius: 6px; font-size: .8rem; margin: .5rem 0; }
+  .poolrow { display: flex; gap: .4rem; flex-wrap: wrap; font-size: .75rem; margin-top: .3rem; }
+  .poolrow span { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
+                  padding: .1rem .45rem; color: var(--mut); }
 </style>
 </head>
 <body>
 <header>
   <div class="headrow">
     <h1>IAL Papers <span>· Downloader</span></h1>
-    <button id="theme">☀ Light</button>
+    <div class="headbtns">
+      <button id="theme">☀ Light</button>
+      <button id="closeserver" title="Stop the local server">Close server</button>
+    </div>
   </div>
   <nav>
     <button data-tab="download" class="active">Download</button>
     <button data-tab="library">Library</button>
     <button data-tab="setup">Setup</button>
+    <button data-tab="planner">Planner</button>
   </nav>
 </header>
 <main>
@@ -148,9 +191,9 @@ HTML = """<!doctype html>
         <label class="lbl">Years</label>
         <div class="years">
           <div class="yr"><b id="y0v">2022</b><span>start year</span><input type="range" id="y0" min="YEAR_MIN" max="YEAR_MAX" value="2022" step="1"></div>
-          <div class="yr"><b id="y1v">2025</b><span>end year</span><input type="range" id="y1" min="YEAR_MIN" max="YEAR_MAX" value="2025" step="1"></div>
+          <div class="yr"><b id="y1v">2026</b><span>end year</span><input type="range" id="y1" min="YEAR_MIN" max="YEAR_MAX" value="YEAR_MAX" step="1"></div>
         </div>
-        <div class="yrrange" id="yrlabel">2022 – 2025</div>
+        <div class="yrrange" id="yrlabel">2022 – 2026</div>
 
         <label class="lbl">Sessions</label>
         <div class="checks" id="sessions">
@@ -228,6 +271,86 @@ HTML = """<!doctype html>
     </div>
   </section>
 
+
+  <!-- PLANNER TAB -->
+  <section id="tab-planner" class="tab">
+    <div class="grid2">
+      <div class="card">
+        <h2>Plan your past papers</h2>
+        <p class="hint">Pick what you are sitting, the gap you need to close and how hard you want to go. The planner works out how many papers that takes and spreads them across the weeks you have left.</p>
+
+        <label class="lbl">Subject</label>
+        <select id="p-subject"><option value="">— pick a subject —</option></select>
+
+        <label class="lbl">Units</label>
+        <div class="unitbox" id="p-units"><div class="hint">Pick a subject first.</div></div>
+        <div class="unit-actions"><span id="p-uall">✓ Select all</span><span id="p-unone">✗ Clear</span></div>
+
+        <label class="lbl">Paper pool</label>
+        <div class="checks" id="p-scope">
+          <label><input type="radio" name="p-scope" value="new" checked> New spec only</label>
+          <label><input type="radio" name="p-scope" value="all"> New + legacy</label>
+          <label><input type="radio" name="p-scope" value="count"> Only this many</label>
+        </div>
+        <div class="row" id="p-countrow" style="display:none">
+          <input type="number" id="p-count" value="5" min="1" max="80" style="max-width:90px">
+          <span class="hint">papers across all selected units</span>
+        </div>
+
+        <label class="lbl">Grades</label>
+        <div class="row">
+          <select id="p-current" style="max-width:110px"></select>
+          <span class="hint">now</span>
+          <span class="hint">→</span>
+          <select id="p-target" style="max-width:110px"></select>
+          <span class="hint">target</span>
+        </div>
+
+        <label class="lbl">Dates</label>
+        <div class="row">
+          <input type="date" id="p-start">
+          <span class="hint">start</span>
+          <input type="date" id="p-exam">
+          <span class="hint">exam day</span>
+        </div>
+
+        <label class="lbl">Intensity</label>
+        <div class="row">
+          <select id="p-intensity" style="max-width:230px">
+            <option value="2">Light · 2 sessions a week</option>
+            <option value="3">Steady · 3 sessions a week</option>
+            <option value="4" selected>Focused · 4 sessions a week</option>
+            <option value="5">Hard · 5 sessions a week</option>
+            <option value="6">Brutal · 6 sessions a week</option>
+            <option value="7">Maximum · 7 sessions a week</option>
+          </select>
+          <input type="number" id="p-mins" value="75" min="20" max="240" style="max-width:90px">
+          <span class="hint">minutes per session</span>
+        </div>
+
+        <button class="cta" id="p-build">Build plan</button>
+        <div class="status" id="p-status"></div>
+      </div>
+
+      <div class="card">
+        <h2>What it works out</h2>
+        <div id="p-summary" class="hint">Nothing planned yet.</div>
+        <h2 style="margin-top:1.3rem">Papers available</h2>
+        <div id="p-pool" class="hint">Pick a subject.</div>
+      </div>
+    </div>
+
+    <div class="card" id="p-calendar-card" style="display:none">
+      <div class="pcal-toolbar">
+        <h2 style="margin:0">Plan</h2>
+        <span class="hint" id="p-progress"></span>
+        <span style="flex:1"></span>
+        <button class="small" id="p-ics">Download .ics</button>
+        <button class="small danger" id="p-clear">Clear plan</button>
+      </div>
+      <div class="pcal" id="p-calendar"></div>
+    </div>
+  </section>
 </main>
 
 <script>
@@ -489,7 +612,609 @@ $('y1').addEventListener('input', () => { if (+$('y1').value < +$('y0').value) $
   await loadSettings();
   await refreshAll();
   syncYearLabels();
+  await pInit();
 })();
+
+// ---- close the local server ----
+$('closeserver').addEventListener('click', async () => {
+  if (!confirm('Stop the server? Downloads and the planner stop working until you start it again.')) return;
+  try {
+    await fetch('/api/shutdown', { method: 'POST', headers: { 'X-Ial-Papers': 'shutdown' } });
+  } catch (e) { /* the connection drops as the process exits, which is expected */ }
+
+  document.body.innerHTML =
+    '<div class="stopped">' +
+    '<h2>Server stopped</h2>' +
+    '<p class="hint">Python is no longer running. Downloads are saved in <code>papers/</code> and the plan is saved in <code>plan.json</code>.</p>' +
+    '<p class="hint">You can close this tab. To start again, double click <b>start-mac.command</b> or run <code>python3 web.py</code>.</p>' +
+    '</div>';
+});
+
+// ================= study planner =================
+// Exported on window so the maths can be exercised from a test harness.
+// Pure functions first, so the maths can be tested without a browser.
+
+const GRADES = ['A*', 'A', 'B', 'C', 'D', 'E', 'U'];
+const GRADE_RANK = { 'A*': 6, A: 5, B: 4, C: 3, D: 2, E: 1, U: 0 };
+// Papers per unit for a grade gap of 0, 1, 2, 3, 4+. Maintenance, then real work.
+const PAPERS_PER_GAP = [2, 4, 6, 8, 10];
+const SESSION_RANK = { January: 1, March: 3, June: 6, October: 10, November: 11 };
+const MAX_PER_WEEK = 7;
+const WEEK_OFFSETS = { 1: [1], 2: [1, 4], 3: [1, 3, 5], 4: [1, 2, 4, 5], 5: [1, 2, 3, 4, 5], 6: [1, 2, 3, 4, 5, 6], 7: [1, 2, 3, 4, 5, 6, 7] };
+
+function gradeGap(current, target) {
+  return Math.max(0, (GRADE_RANK[target] || 0) - (GRADE_RANK[current] || 0));
+}
+
+function papersRequired(gap, unitCount) {
+  const perUnit = PAPERS_PER_GAP[Math.min(gap, PAPERS_PER_GAP.length - 1)];
+  return perUnit * Math.max(1, unitCount);
+}
+
+function sessionRank(session) {
+  return SESSION_RANK[session] || 6;
+}
+
+function paperSortKey(p) {
+  return [Number(p.year) || 0, sessionRank(p.session), p.unit || ''];
+}
+
+function sortPapersAscending(papers) {
+  return papers.slice().sort((a, b) => {
+    const ka = paperSortKey(a), kb = paperSortKey(b);
+    for (let i = 0; i < 3; i += 1) {
+      if (ka[i] < kb[i]) return -1;
+      if (ka[i] > kb[i]) return 1;
+    }
+    return 0;
+  });
+}
+
+// Newest papers first, one per unit in turn, so a small pool stays balanced.
+function pickNewestBalanced(pool, wanted) {
+  const byUnit = {};
+  for (const p of sortPapersAscending(pool)) (byUnit[p.unit] = byUnit[p.unit] || []).push(p);
+  const units = Object.keys(byUnit).sort();
+  const picked = [];
+  let round = 0;
+  while (picked.length < wanted) {
+    let addedThisRound = 0;
+    for (const unit of units) {
+      const stack = byUnit[unit];
+      if (!stack.length) continue;
+      picked.push(stack.pop());
+      addedThisRound += 1;
+      if (picked.length >= wanted) break;
+    }
+    if (!addedThisRound) break;
+    round += 1;
+    if (round > 200) break;
+  }
+  return sortPapersAscending(picked);
+}
+
+function selectPool(papers, units, scope, count) {
+  let pool = papers.filter((p) => units.includes(p.unit));
+  if (scope === 'new') pool = pool.filter((p) => p.spec === 'new');
+  pool = sortPapersAscending(pool);
+
+  if (scope === 'count') {
+    const wanted = Math.max(1, Number(count) || 5);
+    const picked = pool.length <= wanted ? pool : pickNewestBalanced(pool, wanted);
+    return { pool: picked, available: pool.length, shortfall: 0 };
+  }
+
+  return { pool, available: pool.length, shortfall: 0 };
+}
+
+function parseDay(iso) {
+  return new Date(iso + 'T00:00:00');
+}
+
+function isoDay(date) {
+  const d = new Date(date.getTime() - date.getTimezoneOffset() * 60000);
+  return d.toISOString().slice(0, 10);
+}
+
+function addDays(date, n) {
+  const d = new Date(date);
+  d.setDate(d.getDate() + n);
+  return d;
+}
+
+function mondayOf(date) {
+  const d = new Date(date);
+  const day = d.getDay() || 7; // Sunday counts as 7
+  return addDays(d, 1 - day);
+}
+
+function buildSlots(startIso, examIso, perWeek) {
+  const offsets = WEEK_OFFSETS[perWeek] || WEEK_OFFSETS[4];
+  const start = parseDay(startIso);
+  const exam = parseDay(examIso);
+  const slots = [];
+  let monday = mondayOf(start);
+
+  while (monday < exam) {
+    for (const offset of offsets) {
+      const day = addDays(monday, offset - 1);
+      if (day >= start && day < exam) slots.push(day);
+    }
+    monday = addDays(monday, 7);
+  }
+  return slots;
+}
+
+/**
+ * The smallest sessions-per-week the plan actually fits into, or null when even
+ * a session every day of the week is not enough. Guessing at this with
+ * ceil(tasks / weeks) used to promise a number that did not fit.
+ */
+function sessionsPerWeekNeeded(taskCount, startIso, examIso) {
+  for (let perWeek = 1; perWeek <= MAX_PER_WEEK; perWeek += 1) {
+    if (buildSlots(startIso, examIso, perWeek).length >= taskCount) return perWeek;
+  }
+  return null;
+}
+
+function buildSequence(pool) {
+  // Only the newest paper of a unit is a timed mock, and only when the plan has
+  // an earlier paper for that unit. A lone paper is practice, not a mock.
+  const newestByUnit = {};
+  const countByUnit = {};
+  for (const p of pool) {
+    newestByUnit[p.unit] = p;
+    countByUnit[p.unit] = (countByUnit[p.unit] || 0) + 1;
+  }
+
+  const tasks = [];
+  pool.forEach((paper, index) => {
+    const isMock = newestByUnit[paper.unit] === paper && countByUnit[paper.unit] > 1;
+    tasks.push({ type: isMock ? 'mock' : 'paper', paper });
+    // Every second paper is followed by a review of both, which is the spacing.
+    if (index % 2 === 1) {
+      tasks.push({ type: 'review', covers: [pool[index - 1], pool[index]] });
+    }
+  });
+  return tasks;
+}
+
+/**
+ * Spread the sessions across the whole run-up instead of bunching them at the
+ * start. A 5-paper plan over 8 weeks should not finish by week two.
+ */
+function spreadSchedule(tasks, slots) {
+  if (!tasks.length || !slots.length) return [];
+  if (tasks.length > slots.length) {
+    return tasks.slice(0, slots.length).map((task, i) => {
+      const date = isoDay(slots[i]);
+      return { ...task, date, id: taskId(task, date) };
+    });
+  }
+  return tasks.map((task, i) => {
+    const index = tasks.length === 1
+      ? Math.floor(slots.length / 2)
+      : Math.round((i * (slots.length - 1)) / (tasks.length - 1));
+    const date = isoDay(slots[index]);
+    return { ...task, date, id: taskId(task, date) };
+  });
+}
+
+function buildPlan(config, papers) {
+  const units = config.units && config.units.length ? config.units : Object.keys(
+    papers.reduce((acc, p) => { acc[p.unit] = 1; return acc; }, {}));
+  const gap = gradeGap(config.current, config.target);
+  const selection = selectPool(papers, units, config.scope, config.count);
+  const wanted = config.scope === 'count'
+    ? Math.max(1, Number(config.count) || 5)
+    : papersRequired(gap, units.length);
+
+  // Doing every paper in a 40-paper pool is not a plan, it is a pile.
+  // Take the newest ones that the grade gap actually calls for.
+  const pool = (config.scope !== 'count' && selection.pool.length > wanted)
+    ? pickNewestBalanced(selection.pool, wanted)
+    : selection.pool;
+
+  const warnings = [];
+  if (pool.length < wanted) {
+    warnings.push('Only ' + pool.length + ' papers match that pool, so the plan uses all of them. Download or widen the pool for the full ' + wanted + '.');
+  }
+  if (!pool.length) {
+    warnings.push('No papers match. Widen the pool or download more for this subject.');
+  }
+
+  const tasks = buildSequence(pool);
+  const slots = buildSlots(config.start, config.exam, Number(config.perWeek) || 4);
+  const days = Math.max(1, Math.round((parseDay(config.exam) - parseDay(config.start)) / 86400000));
+  const weeks = Math.max(1, Math.ceil(days / 7));
+  const feasible = tasks.length <= slots.length;
+  const perWeekNeeded = feasible
+    ? null
+    : sessionsPerWeekNeeded(tasks.length, config.start, config.exam);
+  const recommendedPerWeek = perWeekNeeded || Math.min(MAX_PER_WEEK, Math.max(1, Math.ceil(tasks.length / weeks)));
+
+  if (!feasible) {
+    warnings.push(perWeekNeeded
+      ? 'This needs ' + tasks.length + ' sessions but there are only ' + slots.length + ' before the exam. At ' + perWeekNeeded + ' sessions a week it fits, or cut the scope.'
+      : 'This needs ' + tasks.length + ' sessions and there are only ' + slots.length + ' before the exam. Even ' + MAX_PER_WEEK + ' sessions a week is not enough, so cut the scope.');
+  }
+
+  const scheduled = spreadSchedule(tasks, slots);
+
+  const unscheduled = Math.max(0, tasks.length - slots.length);
+
+  return {
+    config,
+    gap,
+    wanted,
+    pool,
+    available: selection.available,
+    tasks: scheduled,
+    unscheduled,
+    stats: {
+      papers: pool.length,
+      mocks: scheduled.filter((t) => t.type === 'mock').length,
+      reviews: scheduled.filter((t) => t.type === 'review').length,
+      sessions: tasks.length,
+      scheduled: scheduled.length,
+      slots: slots.length,
+      weeks,
+      days,
+      feasible,
+      recommendedPerWeek,
+      perWeekNeeded,
+      hours: Math.round((pool.length * (Number(config.mins) || 75)) / 60 * 10) / 10
+    },
+    warnings
+  };
+}
+
+function taskId(task, date) {
+  if (task.type === 'review') {
+    return ['review', task.covers.map((p) => p.unit + p.session + p.year).join('-'), date].join('|');
+  }
+  return [task.type, task.paper.unit, task.paper.session, task.paper.year, date].join('|');
+}
+
+function paperName(paper) {
+  return (paper.unit || '?') + ' · ' + (paper.session || '?') + ' ' + (paper.year || '');
+}
+
+function taskLabel(task) {
+  if (task.type === 'review') {
+    return 'Review ' + task.covers.map((p) => p.unit).join(' + ');
+  }
+  return paperName(task.paper);
+}
+
+function overviewWeeks(startIso, examIso, tasks) {
+  const start = parseDay(startIso);
+  const exam = parseDay(examIso);
+  const byDate = {};
+  for (const task of tasks) (byDate[task.date] = byDate[task.date] || []).push(task);
+
+  const out = [];
+  let monday = mondayOf(start);
+  while (monday < exam) {
+    const days = [];
+    for (let i = 0; i < 7; i += 1) {
+      const day = addDays(monday, i);
+      days.push({
+        date: isoDay(day),
+        inRange: day >= start && day <= exam,
+        tasks: byDate[isoDay(day)] || []
+      });
+    }
+    out.push({ monday: isoDay(monday), days });
+    monday = addDays(monday, 7);
+  }
+  return out;
+}
+
+// ================= wiring =================
+
+let P_CATALOGUE = null;
+let P_PLAN = null;
+let P_STATE = { config: {}, done: {} };
+let pSaveTimer = null;
+
+function pSave() {
+  clearTimeout(pSaveTimer);
+  pSaveTimer = setTimeout(() => {
+    fetch('/api/planner/state', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ config: P_STATE.config, done: P_STATE.done })
+    }).catch(() => {});
+  }, 300);
+}
+
+function pGradeSelects() {
+  const cur = $('p-current'), tgt = $('p-target');
+  cur.innerHTML = ''; tgt.innerHTML = '';
+  for (const g of GRADES) {
+    cur.appendChild(new Option(g, g));
+    tgt.appendChild(new Option(g, g));
+  }
+  const cfg = P_STATE.config || {};
+  cur.value = cfg.current || 'C';
+  tgt.value = cfg.target || 'A';
+}
+
+function pDates() {
+  const today = isoDay(new Date());
+  $('p-start').value = (P_STATE.config || {}).start || today;
+  $('p-exam').value = (P_STATE.config || {}).exam || isoDay(addDays(new Date(), 56));
+}
+
+async function pLoadSubject(subject, keepUnits) {
+  const box = $('p-units');
+  if (!subject) { box.innerHTML = '<div class="hint">Pick a subject first.</div>'; return; }
+  box.innerHTML = '<div class="hint">Loading papers…</div>';
+  $('p-pool').textContent = 'Loading…';
+
+  let data;
+  try {
+    data = await json('/api/planner/catalogue?subject=' + encodeURIComponent(subject));
+  } catch (e) {
+    box.innerHTML = '<div class="hint">Could not load the catalogue.</div>';
+    return;
+  }
+  P_CATALOGUE = data;
+
+  const units = {};
+  for (const p of data.papers) {
+    if (!p.unit) continue;
+    const u = units[p.unit] = units[p.unit] || { n: 0, spec: p.spec, label: p.label };
+    u.n += 1;
+  }
+  const codes = Object.keys(units).sort();
+  if (!codes.length) {
+    box.innerHTML = '<div class="hint">No question papers found for this subject. Try the Download tab first.</div>';
+    $('p-pool').textContent = data.warning || 'Nothing found.';
+    return;
+  }
+
+  const chosen = keepUnits && keepUnits.length ? keepUnits : codes.filter((c) => units[c].spec === 'new');
+  const pretty = (l) => { const m = /^U(\\d)$/.exec(l || ''); return m ? 'Unit ' + m[1] : (l || ''); };
+  box.innerHTML = codes.map((c) =>
+    '<label><input type="checkbox" value="' + c + '"' + (chosen.includes(c) ? ' checked' : '') + '>' +
+    '<span>' + c + ' · ' + pretty(units[c].label) + '</span>' +
+    '<span class="u">' + units[c].n + ' qp</span></label>').join('');
+
+  pPoolSummary();
+}
+
+function pSelectedUnits() {
+  return Array.from(document.querySelectorAll('#p-units input:checked')).map((i) => i.value);
+}
+
+function pPoolSummary() {
+  const el = $('p-pool');
+  if (!P_CATALOGUE) { el.textContent = 'Pick a subject.'; return; }
+  const units = pSelectedUnits();
+  const scope = (document.querySelector('input[name="p-scope"]:checked') || {}).value || 'new';
+  const sel = selectPool(P_CATALOGUE.papers, units, scope, $('p-count').value);
+  const scopeLabel = scope === 'new' ? 'new spec' : scope === 'all' ? 'new + legacy' : 'selected';
+  const sessions = new Set(P_CATALOGUE.papers.map((p) => p.session + ' ' + p.year));
+
+  el.innerHTML =
+    '<b>' + sel.pool.length + '</b> papers in the pool (' + scopeLabel + ')' +
+    '<div class="poolrow">' +
+    (P_CATALOGUE.warning ? '<span>⚠ ' + P_CATALOGUE.warning + '</span>' : '<span>source: ' + P_CATALOGUE.source + '</span>') +
+    '<span>' + new Set(sel.pool.map((p) => p.unit)).size + ' units</span>' +
+    '<span>' + sel.pool.length + ' question papers</span>' +
+    '</div>';
+}
+
+function pRenderSummary(plan) {
+  const el = $('p-summary');
+  const s = plan.stats;
+  const verdict = s.feasible
+    ? 'Fits: ' + s.sessions + ' sessions into ' + s.slots + ' available.'
+    : (s.perWeekNeeded
+      ? 'Does not fit at this intensity. Needs ' + s.perWeekNeeded + ' sessions a week.'
+      : 'Does not fit at this intensity. Even ' + MAX_PER_WEEK + ' sessions a week is not enough.');
+
+  el.innerHTML =
+    '<div class="pstat">' +
+    '<div><b>' + s.papers + '</b><span>papers</span></div>' +
+    '<div><b>' + s.mocks + '</b><span>timed mocks</span></div>' +
+    '<div><b>' + s.reviews + '</b><span>reviews</span></div>' +
+    '<div><b>' + s.weeks + '</b><span>weeks left</span></div>' +
+    '<div><b>' + s.hours + '</b><span>hours of papers</span></div>' +
+    '</div>' +
+    '<p class="hint" style="margin:.3rem 0">Grade gap ' + plan.gap + ' · asked for ' + plan.wanted +
+    ' papers · ' + verdict + '</p>' +
+    (plan.warnings.length ? plan.warnings.map((w) => '<div class="warn">' + w + '</div>').join('') : '');
+}
+
+function pRenderCalendar(plan) {
+  const card = $('p-calendar-card');
+  const grid = $('p-calendar');
+  if (!plan.tasks.length) { card.style.display = 'none'; return; }
+  card.style.display = '';
+
+  const done = P_STATE.done || {};
+  const total = plan.tasks.length;
+  const completed = plan.tasks.filter((t) => done[t.id]).length;
+  $('p-progress').textContent = completed + ' of ' + total + ' done';
+
+  const weeks = overviewWeeks(plan.config.start, plan.config.exam, plan.tasks);
+  const dows = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const todayIso = isoDay(new Date());
+
+  grid.innerHTML = weeks.map((week) => {
+    const cells = week.days.map((day, i) => {
+      const label = day.inRange ? dows[i] + ' ' + Number(day.date.slice(-2)) : '';
+      const tasks = day.tasks.map((t) => {
+        const cls = ['ptask', t.type === 'review' ? 'review' : t.type === 'mock' ? 'mock' : 'paper'];
+        if (done[t.id]) cls.push('done');
+        return '<div class="' + cls.join(' ') + '" data-task="' + t.id + '">' +
+          '<b>' + taskLabel(t) + '</b>' +
+          '<span class="sub">' + (t.type === 'review' ? 'review session' : t.type === 'mock' ? 'timed mock' : 'past paper') + '</span>' +
+          '</div>';
+      }).join('');
+      return '<div class="pday' + (day.date === todayIso ? ' today' : '') + '">' +
+        '<span class="dnum">' + label + '</span>' + tasks + '</div>';
+    }).join('');
+    return '<div class="pweek"><div class="plabel">w/c<br>' + week.monday.slice(5) + '</div>' + cells + '</div>';
+  }).join('');
+
+  grid.querySelectorAll('[data-task]').forEach((el) => {
+    el.addEventListener('click', () => {
+      const id = el.dataset.task;
+      P_STATE.done = P_STATE.done || {};
+      if (P_STATE.done[id]) delete P_STATE.done[id]; else P_STATE.done[id] = true;
+      pSave();
+      const completedNow = plan.tasks.filter((t) => P_STATE.done[t.id]).length;
+      $('p-progress').textContent = completedNow + ' of ' + total + ' done';
+      el.classList.toggle('done', !!P_STATE.done[id]);
+    });
+  });
+}
+
+function pBuild() {
+  if (!P_CATALOGUE) { $('p-status').textContent = 'Pick a subject first.'; return; }
+  const scope = (document.querySelector('input[name="p-scope"]:checked') || {}).value || 'new';
+  const config = {
+    subject: $('p-subject').value,
+    units: pSelectedUnits(),
+    scope,
+    count: Number($('p-count').value) || 5,
+    current: $('p-current').value,
+    target: $('p-target').value,
+    start: $('p-start').value,
+    exam: $('p-exam').value,
+    perWeek: Number($('p-intensity').value) || 4,
+    mins: Number($('p-mins').value) || 75
+  };
+
+  if (!config.units.length) { $('p-status').textContent = 'Pick at least one unit.'; return; }
+  if (!config.start || !config.exam || config.exam <= config.start) {
+    $('p-status').textContent = 'The exam date has to be after the start date.';
+    return;
+  }
+
+  P_STATE.config = config;
+  P_PLAN = buildPlan(config, P_CATALOGUE.papers);
+  pSave();
+  pRenderSummary(P_PLAN);
+  pRenderCalendar(P_PLAN);
+  pPoolSummary();
+
+  $('p-status').textContent = P_PLAN.stats.feasible
+    ? 'Plan built. ' + P_PLAN.stats.papers + ' papers over ' + P_PLAN.stats.weeks + ' weeks.'
+    : 'Plan built but it does not fit. Read the warning.';
+}
+
+function pIcs() {
+  if (!P_PLAN || !P_PLAN.tasks.length) return;
+  const subject = P_PLAN.config.subject || 'IAL';
+  const mins = Number(P_PLAN.config.mins) || 75;
+  const stamp = (d) => d.replace(/-/g, '');
+  const lines = ['BEGIN:VCALENDAR', 'VERSION:2.0', 'PRODID:-//ial-papers//planner//EN', 'CALSCALE:GREGORIAN'];
+
+  for (const task of P_PLAN.tasks) {
+    const title = subject + ' · ' + taskLabel(task) + ' (' + (task.type === 'review' ? 'review' : task.type === 'mock' ? 'timed mock' : 'paper') + ')';
+    const start = stamp(task.date) + 'T180000';
+    const endDate = new Date(parseDay(task.date));
+    endDate.setMinutes(endDate.getMinutes() + mins);
+    const end = stamp(isoDay(endDate)) + 'T' + String(endDate.getHours()).padStart(2, '0') + String(endDate.getMinutes()).padStart(2, '0') + '00';
+    lines.push('BEGIN:VEVENT');
+    lines.push('UID:' + task.id.replace(/[^A-Za-z0-9]/g, '-') + '@ial-papers');
+    lines.push('DTSTAMP:' + stamp(isoDay(new Date())) + 'T000000Z');
+    lines.push('DTSTART:' + start);
+    lines.push('DTEND:' + end);
+    lines.push('SUMMARY:' + title.replace(/[,;]/g, ' '));
+    lines.push('DESCRIPTION:Generated by ial-papers study planner');
+    lines.push('END:VEVENT');
+  }
+  lines.push('END:VCALENDAR');
+
+  const blob = new Blob([lines.join('\\r\\n')], { type: 'text/calendar' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'ial-plan-' + (P_PLAN.config.subject || 'study').replace(/\\s+/g, '-').toLowerCase() + '.ics';
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+async function pInit() {
+  pGradeSelects();
+  pDates();
+
+  try {
+    P_STATE = await json('/api/planner/state');
+    P_STATE.done = P_STATE.done || {};
+  } catch (e) { P_STATE = { config: {}, done: {} }; }
+
+  const cfg = P_STATE.config || {};
+  if (cfg.current) $('p-current').value = cfg.current;
+  if (cfg.target) $('p-target').value = cfg.target;
+  if (cfg.perWeek) $('p-intensity').value = String(cfg.perWeek);
+  if (cfg.mins) $('p-mins').value = cfg.mins;
+  if (cfg.scope) {
+    const radio = document.querySelector('input[name="p-scope"][value="' + cfg.scope + '"]');
+    if (radio) radio.checked = true;
+    $('p-countrow').style.display = cfg.scope === 'count' ? '' : 'none';
+  }
+  if (cfg.count) $('p-count').value = cfg.count;
+
+  // Subject list comes from the downloader's own subject index.
+  const sel = $('p-subject');
+  sel.innerHTML = '';
+  if (!Object.keys(ALL_SUBJECTS || {}).length) {
+    try { ALL_SUBJECTS = await json('/api/subjects'); } catch (e) {}
+  }
+  const finalList = Object.keys(ALL_SUBJECTS || {});
+  if (!finalList.length) {
+    sel.innerHTML = '<option value="">No subjects found</option>';
+  } else {
+    sel.innerHTML = '<option value="">— pick a subject —</option>';
+    finalList.sort().forEach((name) => sel.appendChild(new Option(name, name)));
+  }
+  if (cfg.subject) {
+    sel.value = cfg.subject;
+    await pLoadSubject(cfg.subject, cfg.units);
+    if (cfg.start && cfg.exam) pBuild();
+  }
+}
+
+try {
+$('p-subject').addEventListener('change', (e) => { pLoadSubject(e.target.value); });
+$('p-uall').addEventListener('click', () => {
+  document.querySelectorAll('#p-units input').forEach((i) => { i.checked = true; });
+  pPoolSummary();
+});
+$('p-unone').addEventListener('click', () => {
+  document.querySelectorAll('#p-units input').forEach((i) => { i.checked = false; });
+  pPoolSummary();
+});
+document.querySelectorAll('#p-units').forEach((box) => box.addEventListener('change', pPoolSummary));
+$('p-scope').addEventListener('change', () => {
+  const scope = (document.querySelector('input[name="p-scope"]:checked') || {}).value;
+  $('p-countrow').style.display = scope === 'count' ? '' : 'none';
+  pPoolSummary();
+});
+$('p-count').addEventListener('input', pPoolSummary);
+$('p-build').addEventListener('click', pBuild);
+$('p-ics').addEventListener('click', pIcs);
+$('p-clear').addEventListener('click', () => {
+  if (!confirm('Clear the plan and its ticks?')) return;
+  P_STATE = { config: {}, done: {} };
+  P_PLAN = null;
+  pSave();
+  $('p-calendar-card').style.display = 'none';
+  $('p-summary').innerHTML = '<span class="hint">Nothing planned yet.</span>';
+});
+} catch (err) {
+  // A broken planner must never take the downloader down with it.
+  console.error('planner wiring failed', err);
+  const box = $('p-summary');
+  if (box) box.innerHTML = '<div class="warn">The planner failed to start. The other tabs still work.</div>';
+}
+
 </script>
 </body>
 </html>
@@ -560,6 +1285,87 @@ def _scan_ondisk():
                 subjects.append({"subject": name, "pdfs": n,
                                  "size_mb": round(size / 1e6, 1)})
     return subjects
+
+
+_PLANNER_CACHE = {}
+
+
+def _planner_catalogue(subject, refresh=False):
+    """Question papers available for a subject, newest last.
+
+    Tries Pearson first so the planner can offer papers that are not downloaded
+    yet, then falls back to manifest.json, which is what the downloader already
+    knows about. Offline is a supported state, not an error.
+    """
+    if not refresh and subject in _PLANNER_CACHE:
+        return _PLANNER_CACHE[subject]
+
+    papers, source, warning = [], "manifest", ""
+
+    try:
+        # Pearson's facet values are full names ("Question-paper"), not the
+        # short codes the UI uses, so they go through the same mapping the
+        # downloader uses.
+        live = ial.fetch_all(doc_types=_doc_type_variants(["qp"]),
+                             subjects=[subject] if subject else None)
+        for p in live:
+            if getattr(p, "type_short", "") != "qp":
+                continue
+            papers.append({
+                "unit": p.unit_code or "",
+                "label": p.unit_label or "",
+                "session": p.session or "",
+                "year": int(p.year or 0),
+                "variant": getattr(p, "variant", "") or "",
+                "spec": "new" if ial.is_new_spec(p.unit_code or "") else "legacy",
+                "title": p.title or "",
+                "url": p.url or "",
+            })
+        if papers:
+            source = "live"
+        else:
+            warning = "Pearson returned nothing, using the local catalogue instead."
+    except Exception as exc:  # offline, blocked, rate limited
+        warning = "Could not reach Pearson (%s), using the local catalogue." % type(exc).__name__
+
+    if not papers:
+        manifest_path = os.path.join(OUT_ROOT, "manifest.json")
+        try:
+            manifest = json.load(open(manifest_path, encoding="utf-8"))
+            for p in manifest.get("papers", []):
+                if p.get("type") != "Question-paper":
+                    continue
+                if subject and p.get("subject") != subject:
+                    continue
+                unit = p.get("unit") or ""
+                papers.append({
+                    "unit": unit,
+                    "label": p.get("label") or "",
+                    "session": p.get("session") or "",
+                    "year": int(p.get("year") or 0),
+                    "variant": "",
+                    "spec": "new" if ial.is_new_spec(unit) else "legacy",
+                    "title": p.get("title") or "",
+                    "url": p.get("url") or "",
+                })
+        except (OSError, ValueError):
+            papers = []
+
+    # One entry per unit/session/year. Regional variants (A/R suffixes) are the
+    # same paper for planning purposes; keep the plain one when there is a choice.
+    best = {}
+    for p in papers:
+        key = (p["unit"], p["session"], p["year"])
+        rank = 0 if not p["variant"] else 1
+        if key not in best or rank < best[key][0]:
+            best[key] = (rank, p)
+    clean = sorted((v[1] for v in best.values()),
+                   key=lambda p: (p["year"], p["session"], p["unit"]))
+
+    result = {"subject": subject, "source": source, "warning": warning,
+              "papers": clean}
+    _PLANNER_CACHE[subject] = result
+    return result
 
 
 def _list_files():
@@ -697,6 +1503,13 @@ def _run_job(job_id, body):
         job.update(state="error", message=f"{type(exc).__name__}: {exc}")
 
 
+def _stop_server():
+    """Ask serve_forever to return, then let the process exit."""
+    if SERVER is not None:
+        SERVER.shutdown()
+    os._exit(0)
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *args):
         pass
@@ -746,6 +1559,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/force":
             _send_json(self, sorted(_get_force()))
+            return
+        if path == "/api/planner/catalogue":
+            subject = qs.get("subject", [""])[0]
+            if not subject:
+                _send_json(self, {"error": "subject required"}, 400)
+                return
+            refresh = qs.get("refresh", [""])[0] in ("1", "true", "yes")
+            _send_json(self, _planner_catalogue(subject, refresh=refresh))
+            return
+        if path == "/api/planner/state":
+            _send_json(self, _load_json(PLAN_FILE, {"config": {}, "done": {}}))
             return
         if path == "/api/status":
             job_id = qs.get("id", [""])[0]
@@ -801,6 +1625,21 @@ class Handler(BaseHTTPRequestHandler):
             _save_force(s)
             _send_json(self, {"force": sorted(s)})
             return
+        if self.path == "/api/shutdown":
+            # Custom header check: a plain cross-site form post cannot set one,
+            # so another page in the browser cannot stop the server.
+            if self.headers.get("X-Ial-Papers") != "shutdown":
+                _send_json(self, {"error": "missing header"}, 403)
+                return
+            _send_json(self, {"ok": True, "message": "server stopping"})
+            threading.Timer(0.3, _stop_server).start()
+            return
+        if self.path == "/api/planner/state":
+            body.setdefault("config", {})
+            body.setdefault("done", {})
+            _save_json(PLAN_FILE, body)
+            _send_json(self, {"saved": True})
+            return
         if self.path == "/api/settings":
             s = body
             s.setdefault("confined", False)
@@ -820,4 +1659,5 @@ if __name__ == "__main__":
             f"http://localhost:{PORT}")).start()
     except Exception:
         pass
-    ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+    SERVER = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    SERVER.serve_forever()

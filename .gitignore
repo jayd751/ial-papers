@@ -4,3 +4,4 @@ force.json
 __pycache__/
 *.pyc
 .DS_Store
+plan.json
