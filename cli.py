@@ -6,13 +6,18 @@ Commands:
   units SUBJECT                 list units (codes + labels) for a subject
   papers --subject X ...        list matching papers (no download)
   download --subject X ...      download matching papers
+  spec SUBJECT [--download]     find the official specification, optionally save it
+  dates UNIT [UNIT ...]         official exam dates for those units, next series
   sync                          download anything in the catalogue we don't have
 """
 
 import argparse
 import os
 import sys
+import urllib.parse
+import urllib.request
 import webbrowser
+from datetime import date
 
 import ial
 from downloader import download_many, save_manifest, load_manifest
@@ -61,10 +66,13 @@ def load_catalogue(args):
 
 
 def cmd_subjects(args):
-    counts = ial.subjects_with_counts(doc_types=type_names(args))
-    print(f"{'SUBJECT':40s} DOCS")
+    """The subjects the tool supports. Variants are merged and languages are out."""
+    counts = ial.subject_menu()
+    print(f"{'SUBJECT':26s} PAPERS")
     for name, count in counts.items():
-        print(f"{name:40s} {count}")
+        print(f"{name:26s} {count}")
+    print("\nLanguages are hidden on purpose. See LANGUAGE_SUBJECTS in ial.py "
+          "to bring them back.", file=sys.stderr)
 
 
 def cmd_units(args):
@@ -76,6 +84,73 @@ def cmd_units(args):
     for code, u in sorted(units.items()):
         print(f"{code:10s} {u['label']:8s} {u['qp']:4d} {u['ms']:4d} "
               f"{u['er']:4d} {u['other']:4d}")
+
+
+def cmd_spec(args):
+    """Show the specifications Pearson lists for a subject, newest first."""
+    docs = ial.spec_docs(args.subject)
+    if not docs:
+        print(f"No specification listed for {args.subject}.", file=sys.stderr)
+        return
+    chosen = next((d for d in docs if not d["odd"]), docs[0])
+    for d in docs:
+        mark = "*" if d is chosen else " "
+        ver = str(d["version"])
+        if d["issue"]:
+            ver += f" issue {d['issue']}"
+        print(f"{mark} {ver:12s} {d['title'][:58]:60s} {d['url']}")
+    if not args.download:
+        print("\nadd --download to save the starred one", file=sys.stderr)
+        return
+
+    folder = os.path.join(args.out or DEFAULT_OUT, args.subject, "_Specification")
+    os.makedirs(folder, exist_ok=True)
+    dest = os.path.join(folder, ial.spec_filename(args.subject, chosen))
+    if os.path.exists(dest) and not args.force:
+        print(f"already have {dest}", file=sys.stderr)
+        return
+
+    url = ial.DOWNLOAD_BASE + urllib.parse.quote(chosen["url"], safe="/-_.%")
+    print(f"downloading {chosen['title'].strip()} ...", file=sys.stderr)
+    req = urllib.request.Request(url, headers={"User-Agent": ial.USER_AGENT})
+    tmp = dest + ".part"
+    with urllib.request.urlopen(req, timeout=90) as r, open(tmp, "wb") as f:
+        while True:
+            chunk = r.read(1 << 16)
+            if not chunk:
+                break
+            f.write(chunk)
+    with open(tmp, "rb") as f:
+        if not f.read(8).startswith(b"%PDF"):
+            os.remove(tmp)
+            print("Pearson did not return a PDF", file=sys.stderr)
+            return
+    os.replace(tmp, dest)
+    print(dest)
+
+
+def cmd_dates(args):
+    """Official exam dates for unit codes, straight from Pearson's timetable."""
+    series = ial.timetable_series()
+    if not series:
+        print("Could not read Pearson's timetable page.", file=sys.stderr)
+        return
+    picked = None
+    if args.series:
+        want = args.series.lower()
+        picked = next((s for s in series
+                       if want in s["label"].lower() or want in s["file"].lower()), None)
+    if picked is None:
+        today = date.today()
+        picked = next((s for s in series
+                       if (s["year"], s["month"]) >= (today.year, today.month)), series[-1])
+
+    rows = ial.exam_dates(args.units, picked["url"])
+    print(f"{picked['label']} ({len(rows)} sitting(s))")
+    for r in rows:
+        print(f"  {r['date']}  {r['time']:9s} {r['unit']:8s} {r['duration']:8s} {r['title'][:50]}")
+    if rows:
+        print(f"\nfirst paper {rows[0]['date']}, last paper {rows[-1]['date']}")
 
 
 def cmd_stats(args):
@@ -200,7 +275,6 @@ def main():
                        help="qp ms er gb ... (default: qp ms)")
 
     p = sub.add_parser("subjects", help="list IAL subjects")
-    p.add_argument("--types", nargs="+", help="filter doc types")
     p.set_defaults(func=cmd_subjects)
 
     p = sub.add_parser("units", help="list units for a subject")
@@ -221,6 +295,19 @@ def main():
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--limit", type=int, help="max downloads (testing)")
     p.set_defaults(func=cmd_download)
+
+    p = sub.add_parser("spec", help="find a subject specification")
+    p.add_argument("subject")
+    p.add_argument("--download", action="store_true",
+                   help="save the newest spec to papers/<subject>/_Specification/")
+    p.add_argument("--out", help="output root (default: ./papers)")
+    p.add_argument("--force", action="store_true", help="re-download if it exists")
+    p.set_defaults(func=cmd_spec)
+
+    p = sub.add_parser("dates", help="official exam dates for unit codes")
+    p.add_argument("units", nargs="+", help="unit codes, e.g. WBI14 WBI15")
+    p.add_argument("--series", help="e.g. january-2027, summer-2027 (default: the next one)")
+    p.set_defaults(func=cmd_dates)
 
     p = sub.add_parser("sync", help="fetch catalogue, download missing files")
     p.add_argument("--subject")

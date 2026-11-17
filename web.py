@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""web.py — click-to-download dashboard for ial-papers.
+"""web.py — the ial-papers app. Papers, specifications, official exam dates, a
+study planner and a score log, all running locally.
 
 Run:  python3 web.py   then open http://localhost:8000
 """
 
 import json
 import os
+import re
 import threading
+import time
 import urllib.parse
+import urllib.request
+from datetime import date
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import ial
@@ -18,6 +23,10 @@ OUT_ROOT = os.path.join(HERE, "papers")
 SETTINGS_FILE = os.path.join(HERE, "settings.json")
 FORCE_FILE = os.path.join(HERE, "force.json")
 PLAN_FILE = os.path.join(HERE, "plan.json")
+SCORES_FILE = os.path.join(HERE, "scores.json")
+# Specifications live beside the papers but never in the paper grid. One folder
+# per subject, out of the unit/session tree the downloader writes.
+SPEC_DIR = "_Specification"
 PORT = 8000
 YEAR_MIN, YEAR_MAX = 2003, 2026  # YEAR_MAX must track the newest year in the index
 
@@ -129,13 +138,23 @@ HTML = """<!doctype html>
   .toggle input { width:18px; height:18px; accent-color:var(--gold); }
   a { color:var(--blue); }
   /* ---- study planner ---- */
-  .pcal { display: flex; flex-direction: column; gap: .35rem; margin-top: .8rem; }
-  .pweek { display: grid; grid-template-columns: 70px repeat(7, minmax(0, 1fr)); gap: .35rem; }
-  .pweek .plabel { font-size: .72rem; color: var(--mut); padding-top: .4rem; }
+  .pcal { display: flex; flex-direction: column; gap: 1.4rem; margin-top: .9rem; }
+  .pm { display: flex; flex-direction: column; gap: .4rem; }
+  .pmhead { display: flex; align-items: baseline; gap: .6rem;
+            border-bottom: 1px solid var(--line); padding-bottom: .35rem; }
+  .pmhead b { font-size: .78rem; letter-spacing: .1em; text-transform: uppercase; color: var(--gold-l); }
+  .pmhead span { font-size: .72rem; color: var(--mut); }
+  .pcal-head, .pweek { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: .35rem; }
+  .pcal-head { font-size: .66rem; text-transform: uppercase; letter-spacing: .09em; color: var(--mut); }
+  .pcal-head span { text-align: center; }
   .pday { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px;
-          min-height: 62px; padding: .3rem; font-size: .72rem; color: var(--mut); }
+          min-height: 74px; padding: .3rem; font-size: .72rem; color: var(--mut); }
+  .pday.out { opacity: .32; }
   .pday.today { border-color: var(--gold-l); }
-  .pday .dnum { font-size: .68rem; opacity: .7; }
+  .pday.exam { border-color: var(--red); }
+  .pday .dnum { display: block; font-size: .7rem; opacity: .75; }
+  .pday .examt { display: block; font-size: .6rem; text-transform: uppercase;
+                 letter-spacing: .06em; color: var(--red); }
   .ptask { margin-top: .25rem; padding: .28rem .35rem; border-radius: 6px; font-size: .7rem;
            line-height: 1.25; background: var(--panel); border: 1px solid var(--line);
            color: var(--fg); cursor: pointer; }
@@ -155,6 +174,39 @@ HTML = """<!doctype html>
   .poolrow { display: flex; gap: .4rem; flex-wrap: wrap; font-size: .75rem; margin-top: .3rem; }
   .poolrow span { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
                   padding: .1rem .45rem; color: var(--mut); }
+  .pcal-toolbar .btnlink { background: none; border: 0; color: var(--blue); cursor: pointer;
+                  font: inherit; font-size: .8rem; padding: 0; }
+  /* ---- specifications ---- */
+  .specrow { display: flex; gap: .6rem; align-items: center; flex-wrap: wrap; }
+  .specrow select { width: auto; min-width: 200px; flex: 1; }
+  .speconfile { display: flex; gap: .6rem; align-items: center; font-size: .82rem;
+                padding: .35rem 0; border-bottom: 1px solid var(--line); }
+  .speconfile:last-child { border-bottom: 0; }
+  .speconfile .sz { margin-left: auto; color: var(--mut); }
+  /* ---- scores ---- */
+  .srow { display: grid; grid-template-columns: 6.2rem 1fr 4.5rem 2rem; gap: .5rem;
+          align-items: center; padding: .3rem 0; border-bottom: 1px solid var(--line);
+          font-size: .82rem; }
+  .srow:last-child { border-bottom: 0; }
+  .srow .d { color: var(--mut); font-size: .75rem; }
+  .srow .p { font-weight: 600; }
+  .srow .x { background: none; border: 0; color: var(--red); cursor: pointer; font-size: .95rem; }
+  .schart { width: 100%; height: auto; display: block; overflow: visible; }
+  .schart .grid { stroke: var(--line); stroke-width: 1; }
+  .schart .axis { fill: var(--mut); font-size: 10px; }
+  .schart .line { fill: none; stroke: var(--blue); stroke-width: 2; }
+  .schart .avg { fill: none; stroke: var(--gold); stroke-width: 2; stroke-dasharray: 5 4; }
+  .schart .dot { fill: var(--blue); }
+  .schart .dot:hover { fill: var(--gold-l); }
+  .savgs { display: flex; gap: .5rem; flex-wrap: wrap; margin: .6rem 0; }
+  .savgs span { background: var(--panel2); border: 1px solid var(--line); border-radius: 999px;
+                padding: .15rem .55rem; font-size: .75rem; color: var(--mut); }
+  .savgs b { color: var(--fg); }
+  .examrow { display: flex; gap: .5rem; align-items: center; padding: .22rem 0;
+             border-bottom: 1px solid var(--line); font-size: .8rem; }
+  .examrow:last-of-type { border-bottom: 0; }
+  .examrow .d { min-width: 8rem; }
+  .examrow .u { margin-left: auto; color: var(--mut); }
 </style>
 </head>
 <body>
@@ -171,6 +223,7 @@ HTML = """<!doctype html>
     <button data-tab="library">Library</button>
     <button data-tab="setup">Setup</button>
     <button data-tab="planner">Planner</button>
+    <button data-tab="scores">Scores</button>
   </nav>
 </header>
 <main>
@@ -269,6 +322,17 @@ HTML = """<!doctype html>
       <button class="cta" id="savesetup">Save setup</button>
       <div class="status" id="setupstatus"></div>
     </div>
+
+    <div class="card" style="max-width:720px; margin-top:1.1rem">
+      <h2>Specifications</h2>
+      <p class="hint">The official Pearson specification for a subject. One PDF, kept in its own folder so it never mixes with your papers. No units to pick, because a spec covers the whole subject.</p>
+      <div class="specrow">
+        <select id="spec-subject"><option value="">— pick a subject —</option></select>
+        <button class="cta small" id="spec-get">Get specification</button>
+      </div>
+      <div class="status" id="spec-status"></div>
+      <div id="spec-list"></div>
+    </div>
   </section>
 
 
@@ -293,7 +357,7 @@ HTML = """<!doctype html>
           <label><input type="radio" name="p-scope" value="count"> Only this many</label>
         </div>
         <div class="row" id="p-countrow" style="display:none">
-          <input type="number" id="p-count" value="5" min="1" max="80" style="max-width:90px">
+          <input type="number" id="p-count" value="5" min="1" max="200" style="max-width:90px">
           <span class="hint">papers across all selected units</span>
         </div>
 
@@ -313,6 +377,13 @@ HTML = """<!doctype html>
           <input type="date" id="p-exam">
           <span class="hint">exam day</span>
         </div>
+
+        <label class="lbl">Official exam dates</label>
+        <div class="row">
+          <select id="p-series" style="max-width:200px"><option value="">loading…</option></select>
+          <button class="small" id="p-getdates">Find my dates</button>
+        </div>
+        <div id="p-examlist" class="hint"></div>
 
         <label class="lbl">Intensity</label>
         <div class="row">
@@ -349,6 +420,43 @@ HTML = """<!doctype html>
         <button class="small danger" id="p-clear">Clear plan</button>
       </div>
       <div class="pcal" id="p-calendar"></div>
+    </div>
+  </section>
+
+  <!-- SCORES TAB -->
+  <section id="tab-scores" class="tab">
+    <div class="grid2">
+      <div class="card">
+        <h2>Log a score</h2>
+        <p class="hint">Marks from a paper you have done. The chart plots them by the date you sat them, so it shows your progress rather than the year printed on the paper.</p>
+
+        <label class="lbl">Date you did it</label>
+        <input type="date" id="s-date">
+
+        <label class="lbl">Subject</label>
+        <select id="s-subject"><option value="">— optional —</option></select>
+
+        <label class="lbl">Paper</label>
+        <input type="text" id="s-label" list="s-papers" placeholder="e.g. WBI11 · January 2024">
+        <datalist id="s-papers"></datalist>
+
+        <label class="lbl">Marks</label>
+        <div class="row">
+          <input type="number" id="s-raw" min="0" step="0.5" placeholder="mark" style="max-width:110px">
+          <span class="hint">out of</span>
+          <input type="number" id="s-total" min="1" step="0.5" placeholder="total" style="max-width:110px">
+        </div>
+
+        <button class="cta" id="s-add">Log it</button>
+        <div class="status" id="s-status"></div>
+      </div>
+
+      <div class="card">
+        <h2>Improvement</h2>
+        <div id="s-chart" class="hint">No scores yet.</div>
+        <div class="savgs" id="s-avgs"></div>
+        <div id="s-list"></div>
+      </div>
     </div>
   </section>
 </main>
@@ -398,7 +506,7 @@ function renderSubjectSelect() {
   names.sort().forEach(name => {
     const o = document.createElement('option');
     o.value = name;
-    o.textContent = `${name} (${ALL_SUBJECTS[name] || '?'} docs)`;
+    o.textContent = `${name.replace(/-/g, ' ')} (${ALL_SUBJECTS[name] ? ALL_SUBJECTS[name] + ' papers' : 'new spec'})`;
     sel.appendChild(o);
   });
 }
@@ -501,8 +609,8 @@ function renderSetupList() {
   const names = Object.keys(ALL_SUBJECTS).sort();
   box.innerHTML = names.map(s => `
     <div class="subj ${SETTINGS.subjects[s] ? 'open' : ''}" data-subj="${s}">
-      <label><input type="checkbox" class="s-on" ${SETTINGS.subjects[s] ? 'checked' : ''}> ${s}
-        <span class="count">${ALL_SUBJECTS[s]||'?'} docs</span></label>
+      <label><input type="checkbox" class="s-on" ${SETTINGS.subjects[s] ? 'checked' : ''}> ${s.replace(/-/g, ' ')}
+        <span class="count">${ALL_SUBJECTS[s] || 0} papers</span></label>
       <div class="subunits" id="su-${s}"><div class="hint">Loading units…</div></div>
     </div>`).join('');
   document.querySelectorAll('#setuplist .s-on').forEach(cb => cb.addEventListener('change', async (e) => {
@@ -541,6 +649,84 @@ async function loadSettings() {
   $('confined').checked = !!SETTINGS.confined;
   if (Object.keys(ALL_SUBJECTS).length) { renderSubjectSelect(); renderSetupList(); }
 }
+
+// ---- specifications ----
+// Deliberately its own control. A spec is one PDF per subject, not a paper, so it
+// gets one button and its own folder instead of another checkbox in the paper grid.
+let SPEC_DATA = null;
+
+function renderSpecSubjectSelect() {
+  const sel = $('spec-subject');
+  const names = Object.keys(ALL_SUBJECTS || {}).sort();
+  sel.innerHTML = '<option value="">— pick a subject —</option>' +
+    names.map((n) => '<option value="' + n + '">' + n.replace(/-/g, ' ') + '</option>').join('');
+}
+
+async function loadSpec(subject) {
+  SPEC_DATA = null;
+  $('spec-list').innerHTML = '';
+  if (!subject) { $('spec-status').className = 'status'; $('spec-status').textContent = 'Pick a subject.'; return; }
+  $('spec-status').className = 'status';
+  $('spec-status').textContent = 'Looking for the specification…';
+  try {
+    SPEC_DATA = await json('/api/spec?subject=' + encodeURIComponent(subject));
+  } catch (e) {
+    $('spec-status').className = 'status err';
+    $('spec-status').textContent = 'Could not reach the local server.';
+    return;
+  }
+  renderSpec();
+}
+
+function renderSpec() {
+  const d = SPEC_DATA;
+  const st = $('spec-status');
+  const onDisk = (d && d.on_disk) || [];
+  $('spec-list').innerHTML = onDisk.length
+    ? onDisk.map((f) =>
+      '<div class="speconfile"><span>' + f.filename + '</span>' +
+      '<span class="sz">' + f.size_mb + ' MB</span>' +
+      '<a href="/api/pdf?path=' + encodeURIComponent(f.path) + '" target="_blank" rel="noopener">Open</a></div>').join('')
+    : '';
+  if (!d) { st.textContent = ''; return; }
+  if (d.error) { st.className = 'status err'; st.textContent = d.error; return; }
+  if (!d.chosen) {
+    st.className = 'status err';
+    st.textContent = 'Pearson lists no specification for that subject.';
+    return;
+  }
+  st.className = 'status';
+  const bits = [];
+  if (d.chosen.version) bits.push(d.chosen.version);
+  if (d.chosen.issue) bits.push('issue ' + d.chosen.issue);
+  st.textContent = 'Found ' + d.chosen.title.trim() + (bits.length ? ' (' + bits.join(', ') + ')' : '') +
+    (onDisk.length ? ' · already saved' : '');
+}
+
+$('spec-subject').addEventListener('change', (e) => loadSpec(e.target.value));
+$('spec-get').addEventListener('click', async () => {
+  const subject = $('spec-subject').value;
+  if (!subject || !SPEC_DATA || !SPEC_DATA.chosen) { $('spec-status').textContent = 'Pick a subject first.'; return; }
+  const st = $('spec-status');
+  st.className = 'status';
+  st.textContent = 'Downloading…';
+  $('spec-get').disabled = true;
+  try {
+    const r = await json('/api/spec', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subject, url: SPEC_DATA.chosen.url })
+    });
+    if (!r.ok) throw new Error(r.error || 'download failed');
+    st.className = 'status ok';
+    st.textContent = r.skipped ? 'Already saved at ' + r.path : 'Saved to ' + r.path;
+    await loadSpec(subject);
+  } catch (e) {
+    st.className = 'status err';
+    st.textContent = String(e.message || e);
+  } finally {
+    $('spec-get').disabled = false;
+  }
+});
 
 $('confined').addEventListener('change', () => { SETTINGS.confined = $('confined').checked; renderSubjectSelect(); });
 
@@ -610,9 +796,12 @@ $('y1').addEventListener('input', () => { if (+$('y1').value < +$('y0').value) $
   setTheme(savedTheme);
   await loadSubjects();
   await loadSettings();
+  renderSpecSubjectSelect();
+  $('spec-status').textContent = 'Pick a subject to see the specification Pearson lists.';
   await refreshAll();
   syncYearLabels();
   await pInit();
+  await sLoad();
 })();
 
 // ---- close the local server ----
@@ -631,14 +820,14 @@ $('closeserver').addEventListener('click', async () => {
 });
 
 // ================= study planner =================
-// Exported on window so the maths can be exercised from a test harness.
-// Pure functions first, so the maths can be tested without a browser.
+// The maths first. It is deliberately free of DOM calls so a node harness can
+// eval this block and check plans against real catalogue data.
 
 const GRADES = ['A*', 'A', 'B', 'C', 'D', 'E', 'U'];
 const GRADE_RANK = { 'A*': 6, A: 5, B: 4, C: 3, D: 2, E: 1, U: 0 };
 // Papers per unit for a grade gap of 0, 1, 2, 3, 4+. Maintenance, then real work.
 const PAPERS_PER_GAP = [2, 4, 6, 8, 10];
-const SESSION_RANK = { January: 1, March: 3, June: 6, October: 10, November: 11 };
+const SESSION_RANK = { January: 1, February: 2, March: 3, June: 6, Summer: 6, October: 10, November: 11 };
 const MAX_PER_WEEK = 7;
 const WEEK_OFFSETS = { 1: [1], 2: [1, 4], 3: [1, 3, 5], 4: [1, 2, 4, 5], 5: [1, 2, 3, 4, 5], 6: [1, 2, 3, 4, 5, 6], 7: [1, 2, 3, 4, 5, 6, 7] };
 
@@ -653,6 +842,10 @@ function papersRequired(gap, unitCount) {
 
 function sessionRank(session) {
   return SESSION_RANK[session] || 6;
+}
+
+function plural(n, one, many) {
+  return n + ' ' + (Number(n) === 1 ? one : (many || one + 's'));
 }
 
 function paperSortKey(p) {
@@ -670,41 +863,100 @@ function sortPapersAscending(papers) {
   });
 }
 
-// Newest papers first, one per unit in turn, so a small pool stays balanced.
-function pickNewestBalanced(pool, wanted) {
+function unitStacks(pool) {
   const byUnit = {};
   for (const p of sortPapersAscending(pool)) (byUnit[p.unit] = byUnit[p.unit] || []).push(p);
-  const units = Object.keys(byUnit).sort();
-  const picked = [];
-  let round = 0;
-  while (picked.length < wanted) {
-    let addedThisRound = 0;
-    for (const unit of units) {
-      const stack = byUnit[unit];
-      if (!stack.length) continue;
-      picked.push(stack.pop());
-      addedThisRound += 1;
-      if (picked.length >= wanted) break;
+  return byUnit;
+}
+
+/**
+ * k indices across 0..n-1, always including both ends, so the picks cover the
+ * whole history instead of hugging the newest papers.
+ */
+function evenIndices(n, k) {
+  if (k >= n) return Array.from({ length: n }, (_, i) => i);
+  if (k <= 1) return [n - 1];  // one paper should be the newest one
+  const out = [];
+  for (let i = 0; i < k; i += 1) out.push(Math.round((i * (n - 1)) / (k - 1)));
+  return Array.from(new Set(out));
+}
+
+/**
+ * Take `wanted` papers out of a pool, spread evenly across each unit's history.
+ *
+ * Old behaviour took the newest N, so every plan came out as 2025-2026 only and
+ * "new spec" and "new + legacy" produced identical plans. This keeps the newest
+ * paper of every unit (it becomes the timed mock) and samples the rest backwards,
+ * which is the order to actually sit them in.
+ */
+function selectEvenly(pool, wanted) {
+  const stacks = unitStacks(pool);
+  const codes = Object.keys(stacks);
+  const total = pool.length;
+  const take = Math.max(0, Math.min(Math.floor(wanted) || 0, total));
+  if (!take) return [];
+  if (take >= total) return sortPapersAscending(pool);
+
+  // Quota per unit, at least one each, proportional to how much each unit has.
+  const quota = {};
+  let assigned = 0;
+  for (const c of codes) {
+    if (stacks[c].length) { quota[c] = 1; assigned += 1; }
+  }
+  let left = take - assigned;
+  if (left > 0) {
+    const order = codes.slice().sort((a, b) => (stacks[b].length - stacks[a].length) || a.localeCompare(b));
+    let progress = true;
+    while (left > 0 && progress) {
+      progress = false;
+      for (const c of order) {
+        if (left <= 0) break;
+        if (quota[c] < stacks[c].length) { quota[c] += 1; left -= 1; progress = true; }
+      }
     }
-    if (!addedThisRound) break;
-    round += 1;
-    if (round > 200) break;
+  } else if (left < 0) {
+    // Fewer papers than units. Drop the units whose newest paper is oldest, so a
+    // tiny plan still covers the units that were examined most recently.
+    const order = codes.slice().sort((a, b) => {
+      const ka = paperSortKey(stacks[a][stacks[a].length - 1]);
+      const kb = paperSortKey(stacks[b][stacks[b].length - 1]);
+      return ka[0] - kb[0] || ka[1] - kb[1] || a.localeCompare(b);
+    });
+    for (const c of order) {
+      if (left >= 0) break;
+      if (quota[c] > 0) { quota[c] = 0; left += 1; }
+    }
+  }
+
+  const picked = [];
+  for (const c of codes) {
+    const stack = stacks[c];
+    const n = quota[c] || 0;
+    if (!n) continue;
+    for (const i of evenIndices(stack.length, n)) picked.push(stack[i]);
   }
   return sortPapersAscending(picked);
 }
 
-function selectPool(papers, units, scope, count) {
+/** The pool as filtered, with no trimming. Trimming is a separate decision. */
+function selectPool(papers, units, scope) {
   let pool = papers.filter((p) => units.includes(p.unit));
   if (scope === 'new') pool = pool.filter((p) => p.spec === 'new');
   pool = sortPapersAscending(pool);
+  return { pool, available: pool.length };
+}
 
-  if (scope === 'count') {
-    const wanted = Math.max(1, Number(count) || 5);
-    const picked = pool.length <= wanted ? pool : pickNewestBalanced(pool, wanted);
-    return { pool: picked, available: pool.length, shortfall: 0 };
-  }
-
-  return { pool, available: pool.length, shortfall: 0 };
+/**
+ * Why a pool came out empty, when the reason is not just "no papers". Ticking a
+ * legacy unit such as BI04 while the pool is set to new spec only gives zero and
+ * used to blame the catalogue.
+ */
+function poolNote(papers, units, scope) {
+  if (scope !== 'new' || !units.length) return '';
+  const inUnits = papers.filter((p) => units.includes(p.unit));
+  if (!inUnits.length) return '';
+  if (inUnits.some((p) => p.spec === 'new')) return '';
+  return 'Every unit you ticked is legacy, and the pool is set to new spec only. Switch the pool to New + legacy, or tick a unit under Current spec.';
 }
 
 function parseDay(iso) {
@@ -758,104 +1010,140 @@ function sessionsPerWeekNeeded(taskCount, startIso, examIso) {
 }
 
 function buildSequence(pool) {
-  // Only the newest paper of a unit is a timed mock, and only when the plan has
-  // an earlier paper for that unit. A lone paper is practice, not a mock.
-  const newestByUnit = {};
-  const countByUnit = {};
-  for (const p of pool) {
-    newestByUnit[p.unit] = p;
-    countByUnit[p.unit] = (countByUnit[p.unit] || 0) + 1;
+  // Every paper except the newest of its unit is practice. The newest paper of
+  // each unit is the timed mock, and mocks sit at the very end of the plan so
+  // the last thing done before the exam is the closest thing to the exam.
+  const counts = {};
+  for (const p of pool) counts[p.unit] = (counts[p.unit] || 0) + 1;
+  const newest = {};
+  for (const p of sortPapersAscending(pool)) newest[p.unit] = p;
+
+  const practice = [];
+  const mocks = [];
+  for (const p of sortPapersAscending(pool)) {
+    if (newest[p.unit] === p && counts[p.unit] > 1) mocks.push(p);
+    else practice.push(p);
   }
 
   const tasks = [];
-  pool.forEach((paper, index) => {
-    const isMock = newestByUnit[paper.unit] === paper && countByUnit[paper.unit] > 1;
-    tasks.push({ type: isMock ? 'mock' : 'paper', paper });
-    // Every second paper is followed by a review of both, which is the spacing.
-    if (index % 2 === 1) {
-      tasks.push({ type: 'review', covers: [pool[index - 1], pool[index]] });
-    }
-  });
+  const addBlock = (list, type) => {
+    list.forEach((paper, index) => {
+      tasks.push({ type, paper });
+      // Every second paper is followed by a review of both, which is the spacing.
+      if (index % 2 === 1) {
+        tasks.push({ type: 'review', covers: [list[index - 1], paper] });
+      }
+    });
+  };
+  addBlock(practice, 'paper');
+  addBlock(mocks, 'mock');
   return tasks;
+}
+
+/** Largest evenly spread subset of `pool` whose tasks still fit the slots. */
+function fitPool(pool, slotCount, maxPapers) {
+  if (!slotCount) return [];
+  let k = Math.min(pool.length, maxPapers, slotCount);
+  while (k > 1 && buildSequence(selectEvenly(pool, k)).length > slotCount) k -= 1;
+  return selectEvenly(pool, k);
 }
 
 /**
  * Spread the sessions across the whole run-up instead of bunching them at the
  * start. A 5-paper plan over 8 weeks should not finish by week two.
+ *
+ * Dates are strictly increasing and the last session lands on the last free day,
+ * so the plan always walks forward and never stacks two sessions on one day.
  */
 function spreadSchedule(tasks, slots) {
-  if (!tasks.length || !slots.length) return [];
-  if (tasks.length > slots.length) {
-    return tasks.slice(0, slots.length).map((task, i) => {
-      const date = isoDay(slots[i]);
-      return { ...task, date, id: taskId(task, date) };
-    });
-  }
-  return tasks.map((task, i) => {
-    const index = tasks.length === 1
-      ? Math.floor(slots.length / 2)
-      : Math.round((i * (slots.length - 1)) / (tasks.length - 1));
+  const n = Math.min(tasks.length, slots.length);
+  if (!n) return [];
+  const out = [];
+  let cursor = 0;
+  for (let i = 0; i < n; i += 1) {
+    const target = n === 1 ? slots.length - 1
+      : Math.round((i * (slots.length - 1)) / (n - 1));
+    // Leave room for the sessions still to come, then never go backwards.
+    const ceiling = slots.length - (n - 1 - i) - 1;
+    let index = Math.max(cursor, Math.min(target, ceiling));
+    if (i === n - 1) index = slots.length - 1;
+    if (index >= slots.length) index = slots.length - 1;
+    cursor = index + 1;
     const date = isoDay(slots[index]);
-    return { ...task, date, id: taskId(task, date) };
-  });
+    out.push({ ...tasks[i], date, id: taskId(tasks[i]) });
+  }
+  return out;
 }
 
 function buildPlan(config, papers) {
   const units = config.units && config.units.length ? config.units : Object.keys(
     papers.reduce((acc, p) => { acc[p.unit] = 1; return acc; }, {}));
   const gap = gradeGap(config.current, config.target);
-  const selection = selectPool(papers, units, config.scope, config.count);
+  const selection = selectPool(papers, units, config.scope);
+  const available = selection.available;
+
+  // How many papers the request actually asks for. The grade gap decides it,
+  // unless the pool scope is an explicit count.
   const wanted = config.scope === 'count'
     ? Math.max(1, Number(config.count) || 5)
     : papersRequired(gap, units.length);
 
-  // Doing every paper in a 40-paper pool is not a plan, it is a pile.
-  // Take the newest ones that the grade gap actually calls for.
-  const pool = (config.scope !== 'count' && selection.pool.length > wanted)
-    ? pickNewestBalanced(selection.pool, wanted)
-    : selection.pool;
-
-  const warnings = [];
-  if (pool.length < wanted) {
-    warnings.push('Only ' + pool.length + ' papers match that pool, so the plan uses all of them. Download or widen the pool for the full ' + wanted + '.');
-  }
-  if (!pool.length) {
-    warnings.push('No papers match. Widen the pool or download more for this subject.');
-  }
-
-  const tasks = buildSequence(pool);
   const slots = buildSlots(config.start, config.exam, Number(config.perWeek) || 4);
   const days = Math.max(1, Math.round((parseDay(config.exam) - parseDay(config.start)) / 86400000));
   const weeks = Math.max(1, Math.ceil(days / 7));
-  const feasible = tasks.length <= slots.length;
+
+  // What the full request would cost in sessions, at this intensity.
+  const askedPool = selectEvenly(selection.pool, Math.min(wanted, available));
+  const asked = buildSequence(askedPool);
+  const feasible = asked.length <= slots.length;
   const perWeekNeeded = feasible
     ? null
-    : sessionsPerWeekNeeded(tasks.length, config.start, config.exam);
-  const recommendedPerWeek = perWeekNeeded || Math.min(MAX_PER_WEEK, Math.max(1, Math.ceil(tasks.length / weeks)));
+    : sessionsPerWeekNeeded(asked.length, config.start, config.exam);
+  const recommendedPerWeek = perWeekNeeded
+    || Math.min(MAX_PER_WEEK, Math.max(1, Math.ceil(asked.length / weeks)));
 
-  if (!feasible) {
-    warnings.push(perWeekNeeded
-      ? 'This needs ' + tasks.length + ' sessions but there are only ' + slots.length + ' before the exam. At ' + perWeekNeeded + ' sessions a week it fits, or cut the scope.'
-      : 'This needs ' + tasks.length + ' sessions and there are only ' + slots.length + ' before the exam. Even ' + MAX_PER_WEEK + ' sessions a week is not enough, so cut the scope.');
-  }
-
+  // Then build the plan that fits. Trim from the papers, never from the mocks.
+  const pool = fitPool(selection.pool, slots.length, Math.min(wanted, available));
+  const tasks = buildSequence(pool);
   const scheduled = spreadSchedule(tasks, slots);
 
-  const unscheduled = Math.max(0, tasks.length - slots.length);
+  const warnings = [];
+  if (!slots.length) {
+    warnings.push('There are no free days between the start date and the exam, so nothing can be scheduled. Move one of the dates.');
+  }
+  if (!available) {
+    warnings.push(poolNote(papers, units, config.scope)
+      || 'No papers match. Widen the pool or download more for this subject.');
+  } else if (available < wanted) {
+    warnings.push('That pool holds ' + available + ' papers and this asks for ' + wanted +
+      '. The plan uses what is there.');
+  }
+  const fitTarget = Math.min(wanted, available);
+  if (available && slots.length && pool.length < fitTarget) {
+    warnings.push('The plan fits ' + pool.length + ' of the ' + fitTarget + ' papers into the ' +
+      plural(slots.length, 'session') + ' you have before the exam, so it uses a spread of those. ' +
+      (perWeekNeeded
+        ? 'At ' + perWeekNeeded + ' sessions a week all ' + fitTarget + ' would fit.'
+        : 'Even ' + MAX_PER_WEEK + ' sessions a week would not fit all ' + fitTarget +
+          ', so take fewer units or a smaller pool.'));
+  }
+
+  const mins = Number(config.mins) || 75;
 
   return {
     config,
     gap,
     wanted,
     pool,
-    available: selection.available,
+    available,
     tasks: scheduled,
-    unscheduled,
+    unscheduled: Math.max(0, tasks.length - scheduled.length),
     stats: {
       papers: pool.length,
       mocks: scheduled.filter((t) => t.type === 'mock').length,
       reviews: scheduled.filter((t) => t.type === 'review').length,
-      sessions: tasks.length,
+      sessions: scheduled.length,
+      sessionsAsked: asked.length,
       scheduled: scheduled.length,
       slots: slots.length,
       weeks,
@@ -863,17 +1151,17 @@ function buildPlan(config, papers) {
       feasible,
       recommendedPerWeek,
       perWeekNeeded,
-      hours: Math.round((pool.length * (Number(config.mins) || 75)) / 60 * 10) / 10
+      hours: Math.round((scheduled.length * mins) / 60 * 10) / 10
     },
     warnings
   };
 }
 
-function taskId(task, date) {
+function taskId(task) {
   if (task.type === 'review') {
-    return ['review', task.covers.map((p) => p.unit + p.session + p.year).join('-'), date].join('|');
+    return ['review', task.covers.map((p) => p.unit + p.session + p.year).join('-')].join('|');
   }
-  return [task.type, task.paper.unit, task.paper.session, task.paper.year, date].join('|');
+  return [task.type, task.paper.unit, task.paper.session, task.paper.year].join('|');
 }
 
 function paperName(paper) {
@@ -887,28 +1175,48 @@ function taskLabel(task) {
   return paperName(task.paper);
 }
 
-function overviewWeeks(startIso, examIso, tasks) {
+const DOWS = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const MONTHS = ['January', 'February', 'March', 'April', 'May', 'June', 'July',
+  'August', 'September', 'October', 'November', 'December'];
+
+/**
+ * The plan as calendar months, each with its own weekday header and its weeks.
+ * A week is filed under the month its Thursday falls in, so a week that straddles
+ * a month end does not show up under the wrong heading.
+ */
+function calendarMonths(startIso, examIso, tasks) {
   const start = parseDay(startIso);
   const exam = parseDay(examIso);
+  const examIsoDay = isoDay(exam);
   const byDate = {};
   for (const task of tasks) (byDate[task.date] = byDate[task.date] || []).push(task);
 
-  const out = [];
+  const months = [];
+  const seen = {};
   let monday = mondayOf(start);
-  while (monday < exam) {
+  while (monday <= exam) {
     const days = [];
     for (let i = 0; i < 7; i += 1) {
       const day = addDays(monday, i);
+      const iso = isoDay(day);
       days.push({
-        date: isoDay(day),
+        date: iso,
+        dayNum: day.getDate(),
         inRange: day >= start && day <= exam,
-        tasks: byDate[isoDay(day)] || []
+        isExam: iso === examIsoDay,
+        tasks: byDate[iso] || []
       });
     }
-    out.push({ monday: isoDay(monday), days });
+    const anchor = addDays(monday, 3);
+    const key = anchor.getFullYear() + '-' + String(anchor.getMonth() + 1).padStart(2, '0');
+    if (!seen[key]) {
+      seen[key] = { key, label: MONTHS[anchor.getMonth()] + ' ' + anchor.getFullYear(), weeks: [] };
+      months.push(seen[key]);
+    }
+    seen[key].weeks.push(days);
     monday = addDays(monday, 7);
   }
-  return out;
+  return months;
 }
 
 // ================= wiring =================
@@ -947,6 +1255,74 @@ function pDates() {
   $('p-exam').value = (P_STATE.config || {}).exam || isoDay(addDays(new Date(), 56));
 }
 
+// ---- official exam dates ----
+// Pearson publishes one xlsx per series. The server reads the sheet, this only
+// has to show the sittings and offer to drop the right date into the plan.
+let P_EXAMS = null;
+const DOW_SHORT = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+function fmtDate(iso) {
+  if (!iso) return '';
+  const d = parseDay(iso);
+  return DOW_SHORT[d.getDay()] + ' ' + d.getDate() + ' ' + MONTHS[d.getMonth()].slice(0, 3) + ' ' + d.getFullYear();
+}
+
+async function pLoadSeries() {
+  const sel = $('p-series');
+  try {
+    const d = await json('/api/timetable');
+    if (!d.series || !d.series.length) {
+      sel.innerHTML = '<option value="">no timetables found</option>';
+      return;
+    }
+    sel.innerHTML = d.series.map((s) =>
+      '<option value="' + s.file + '"' + (d.picked && d.picked.file === s.file ? ' selected' : '') +
+      '>' + s.label + '</option>').join('');
+  } catch (e) {
+    sel.innerHTML = '<option value="">unavailable</option>';
+  }
+}
+
+async function pFindDates() {
+  const box = $('p-examlist');
+  const units = pSelectedUnits();
+  if (!units.length) { box.textContent = 'Tick some units first.'; return; }
+  box.textContent = 'Reading the Pearson timetable…';
+  try {
+    P_EXAMS = await json('/api/timetable?units=' + encodeURIComponent(units.join(',')) +
+      '&series=' + encodeURIComponent($('p-series').value || ''));
+  } catch (e) {
+    box.textContent = 'Could not reach the local server.';
+    return;
+  }
+  pRenderDates();
+}
+
+function pRenderDates() {
+  const d = P_EXAMS;
+  const box = $('p-examlist');
+  if (!d) { box.textContent = ''; return; }
+  if (d.error) { box.innerHTML = '<div class="warn">' + d.error + '</div>'; return; }
+  if (!d.papers.length) {
+    box.textContent = 'Pearson lists no ' + d.picked.label + ' sittings for the units you ticked.';
+    return;
+  }
+  const rows = d.papers.map((p) =>
+    '<div class="examrow"><span class="d">' + fmtDate(p.date) + '</span>' +
+    '<span>' + p.unit + '</span>' +
+    '<span class="u">' + p.time + ' · ' + p.duration + '</span></div>').join('');
+  box.innerHTML = rows +
+    '<div class="row" style="margin-top:.5rem">' +
+    '<button class="small" data-exam="' + d.first + '">Plan up to the first paper</button>' +
+    '<button class="small" data-exam="' + d.last + '">the last paper</button></div>';
+  box.querySelectorAll('[data-exam]').forEach((b) => b.addEventListener('click', () => {
+    $('p-exam').value = b.dataset.exam;
+    pBuild();
+    $('p-status').textContent = 'Exam date set to ' + fmtDate(b.dataset.exam) +
+      ' from the ' + d.picked.label + ' timetable.';
+  }));
+}
+
 async function pLoadSubject(subject, keepUnits) {
   const box = $('p-units');
   if (!subject) { box.innerHTML = '<div class="hint">Pick a subject first.</div>'; return; }
@@ -977,10 +1353,17 @@ async function pLoadSubject(subject, keepUnits) {
 
   const chosen = keepUnits && keepUnits.length ? keepUnits : codes.filter((c) => units[c].spec === 'new');
   const pretty = (l) => { const m = /^U(\\d)$/.exec(l || ''); return m ? 'Unit ' + m[1] : (l || ''); };
-  box.innerHTML = codes.map((c) =>
+  const row = (c) =>
     '<label><input type="checkbox" value="' + c + '"' + (chosen.includes(c) ? ' checked' : '') + '>' +
     '<span>' + c + ' · ' + pretty(units[c].label) + '</span>' +
-    '<span class="u">' + units[c].n + ' qp</span></label>').join('');
+    '<span class="u">' + units[c].n + ' qp</span></label>';
+  // Split the list the way the download tab does. BI04 and WBI14 both print as
+  // "Unit 4", and the legacy one silently vanishes under a new spec pool.
+  const nw = codes.filter((c) => units[c].spec === 'new');
+  const old = codes.filter((c) => units[c].spec !== 'new');
+  box.innerHTML =
+    (nw.length ? '<div class="hint" style="margin:.2rem 0 .3rem">Current spec</div>' + nw.map(row).join('') : '') +
+    (old.length ? '<div class="hint" style="margin:.6rem 0 .3rem">Legacy (skipped by new spec only)</div>' + old.map(row).join('') : '');
 
   pPoolSummary();
 }
@@ -994,17 +1377,22 @@ function pPoolSummary() {
   if (!P_CATALOGUE) { el.textContent = 'Pick a subject.'; return; }
   const units = pSelectedUnits();
   const scope = (document.querySelector('input[name="p-scope"]:checked') || {}).value || 'new';
-  const sel = selectPool(P_CATALOGUE.papers, units, scope, $('p-count').value);
+  const sel = selectPool(P_CATALOGUE.papers, units, scope);
   const scopeLabel = scope === 'new' ? 'new spec' : scope === 'all' ? 'new + legacy' : 'selected';
-  const sessions = new Set(P_CATALOGUE.papers.map((p) => p.session + ' ' + p.year));
+  const years = sel.pool.map((p) => Number(p.year) || 0).filter(Boolean);
+  const span = years.length
+    ? Math.min.apply(null, years) + '–' + Math.max.apply(null, years)
+    : 'no years';
+  const note = sel.available ? '' : poolNote(P_CATALOGUE.papers, units, scope);
 
   el.innerHTML =
     '<b>' + sel.pool.length + '</b> papers in the pool (' + scopeLabel + ')' +
     '<div class="poolrow">' +
     (P_CATALOGUE.warning ? '<span>⚠ ' + P_CATALOGUE.warning + '</span>' : '<span>source: ' + P_CATALOGUE.source + '</span>') +
     '<span>' + new Set(sel.pool.map((p) => p.unit)).size + ' units</span>' +
-    '<span>' + sel.pool.length + ' question papers</span>' +
-    '</div>';
+    '<span>' + span + '</span>' +
+    '</div>' +
+    (note ? '<div class="warn">' + note + '</div>' : '');
 }
 
 function pRenderSummary(plan) {
@@ -1022,11 +1410,21 @@ function pRenderSummary(plan) {
     '<div><b>' + s.mocks + '</b><span>timed mocks</span></div>' +
     '<div><b>' + s.reviews + '</b><span>reviews</span></div>' +
     '<div><b>' + s.weeks + '</b><span>weeks left</span></div>' +
-    '<div><b>' + s.hours + '</b><span>hours of papers</span></div>' +
+    '<div><b>' + s.hours + '</b><span>hours in total</span></div>' +
     '</div>' +
     '<p class="hint" style="margin:.3rem 0">Grade gap ' + plan.gap + ' · asked for ' + plan.wanted +
     ' papers · ' + verdict + '</p>' +
-    (plan.warnings.length ? plan.warnings.map((w) => '<div class="warn">' + w + '</div>').join('') : '');
+    (plan.warnings.length ? plan.warnings.map((w) => '<div class="warn">' + w + '</div>').join('') : '') +
+    (s.perWeekNeeded && s.perWeekNeeded <= MAX_PER_WEEK
+      ? '<button class="small" id="p-useweek" style="margin-top:.5rem">Set intensity to ' +
+        s.perWeekNeeded + ' a week and rebuild</button>'
+      : '');
+
+  const useWeek = $('p-useweek');
+  if (useWeek) useWeek.addEventListener('click', () => {
+    $('p-intensity').value = String(s.perWeekNeeded);
+    pBuild();
+  });
 }
 
 function pRenderCalendar(plan) {
@@ -1040,25 +1438,36 @@ function pRenderCalendar(plan) {
   const completed = plan.tasks.filter((t) => done[t.id]).length;
   $('p-progress').textContent = completed + ' of ' + total + ' done';
 
-  const weeks = overviewWeeks(plan.config.start, plan.config.exam, plan.tasks);
-  const dows = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+  const months = calendarMonths(plan.config.start, plan.config.exam, plan.tasks);
   const todayIso = isoDay(new Date());
 
-  grid.innerHTML = weeks.map((week) => {
-    const cells = week.days.map((day, i) => {
-      const label = day.inRange ? dows[i] + ' ' + Number(day.date.slice(-2)) : '';
-      const tasks = day.tasks.map((t) => {
-        const cls = ['ptask', t.type === 'review' ? 'review' : t.type === 'mock' ? 'mock' : 'paper'];
-        if (done[t.id]) cls.push('done');
-        return '<div class="' + cls.join(' ') + '" data-task="' + t.id + '">' +
-          '<b>' + taskLabel(t) + '</b>' +
-          '<span class="sub">' + (t.type === 'review' ? 'review session' : t.type === 'mock' ? 'timed mock' : 'past paper') + '</span>' +
-          '</div>';
-      }).join('');
-      return '<div class="pday' + (day.date === todayIso ? ' today' : '') + '">' +
-        '<span class="dnum">' + label + '</span>' + tasks + '</div>';
+  const cell = (day) => {
+    const cls = ['pday'];
+    if (!day.inRange) cls.push('out');
+    if (day.date === todayIso) cls.push('today');
+    if (day.isExam) cls.push('exam');
+    const tasks = day.tasks.map((t) => {
+      const tcls = ['ptask', t.type === 'review' ? 'review' : t.type === 'mock' ? 'mock' : 'paper'];
+      if (done[t.id]) tcls.push('done');
+      return '<div class="' + tcls.join(' ') + '" data-task="' + t.id + '">' +
+        '<b>' + taskLabel(t) + '</b>' +
+        '<span class="sub">' + (t.type === 'review' ? 'review session' : t.type === 'mock' ? 'timed mock' : 'past paper') + '</span>' +
+        '</div>';
     }).join('');
-    return '<div class="pweek"><div class="plabel">w/c<br>' + week.monday.slice(5) + '</div>' + cells + '</div>';
+    const num = day.inRange ? '<span class="dnum">' + day.dayNum + '</span>' : '<span class="dnum"></span>';
+    const exam = day.isExam ? '<span class="examt">exam</span>' : '';
+    return '<div class="' + cls.join(' ') + '">' + num + exam + tasks + '</div>';
+  };
+
+  grid.innerHTML = months.map((month) => {
+    let count = 0;
+    for (const week of month.weeks) for (const day of week) count += day.tasks.length;
+    const head = '<div class="pmhead"><b>' + month.label + '</b><span>' +
+      (count ? plural(count, 'session') : 'nothing scheduled') + '</span></div>';
+    const dows = DOWS.map((d) => '<span>' + d + '</span>').join('');
+    const weeks = month.weeks.map((days) =>
+      '<div class="pweek">' + days.map(cell).join('') + '</div>').join('');
+    return '<div class="pm">' + head + '<div class="pcal-head">' + dows + '</div>' + weeks + '</div>';
   }).join('');
 
   grid.querySelectorAll('[data-task]').forEach((el) => {
@@ -1081,7 +1490,7 @@ function pBuild() {
     subject: $('p-subject').value,
     units: pSelectedUnits(),
     scope,
-    count: Number($('p-count').value) || 5,
+    count: Math.max(1, Math.min(200, Number($('p-count').value) || 5)),
     current: $('p-current').value,
     target: $('p-target').value,
     start: $('p-start').value,
@@ -1141,13 +1550,16 @@ function pIcs() {
 }
 
 async function pInit() {
-  pGradeSelects();
-  pDates();
-
+  // State first. Loading it after filling the date inputs used to reset the
+  // saved start and exam dates to today, so a rebuild silently moved the plan.
   try {
     P_STATE = await json('/api/planner/state');
     P_STATE.done = P_STATE.done || {};
   } catch (e) { P_STATE = { config: {}, done: {} }; }
+
+  pGradeSelects();
+  pDates();
+  pLoadSeries();
 
   const cfg = P_STATE.config || {};
   if (cfg.current) $('p-current').value = cfg.current;
@@ -1191,7 +1603,17 @@ $('p-unone').addEventListener('click', () => {
   document.querySelectorAll('#p-units input').forEach((i) => { i.checked = false; });
   pPoolSummary();
 });
-document.querySelectorAll('#p-units').forEach((box) => box.addEventListener('change', pPoolSummary));
+document.querySelectorAll('#p-units').forEach((box) => box.addEventListener('change', () => {
+  // A changed unit selection makes any exam dates on screen stale.
+  P_EXAMS = null;
+  $('p-examlist').textContent = '';
+  pPoolSummary();
+}));
+$('p-getdates').addEventListener('click', pFindDates);
+$('p-series').addEventListener('change', () => {
+  P_EXAMS = null;
+  $('p-examlist').textContent = '';
+});
 $('p-scope').addEventListener('change', () => {
   const scope = (document.querySelector('input[name="p-scope"]:checked') || {}).value;
   $('p-countrow').style.display = scope === 'count' ? '' : 'none';
@@ -1214,6 +1636,171 @@ $('p-clear').addEventListener('click', () => {
   const box = $('p-summary');
   if (box) box.innerHTML = '<div class="warn">The planner failed to start. The other tabs still work.</div>';
 }
+
+// ================= score log =================
+// Marks over time. The x axis is the date the paper was sat, not the year of the
+// paper, so sitting a 2019 paper today shows up as today.
+let SCORES = [];
+
+function sFillSubject() {
+  const sel = $('s-subject');
+  const names = Object.keys(ALL_SUBJECTS || {}).sort();
+  const keep = sel.value || (P_STATE.config || {}).subject || '';
+  sel.innerHTML = '<option value="">— optional —</option>' +
+    names.map((n) => '<option value="' + n + '">' + n.replace(/-/g, ' ') + '</option>').join('');
+  if (keep) sel.value = keep;
+}
+
+function sPaperOptions() {
+  const list = $('s-papers');
+  const done = P_PLAN && P_PLAN.tasks
+    ? P_PLAN.tasks.filter((t) => (P_STATE.done || {})[t.id])
+    : [];
+  list.innerHTML = done.map((t) =>
+    '<option value="' + taskLabel(t) + '"></option>').join('');
+}
+
+function sDateValue(s) {
+  const d = new Date((s.date || '') + 'T00:00:00');
+  return isNaN(d.getTime()) ? null : d.getTime();
+}
+
+function sRenderChart(sorted) {
+  const el = $('s-chart');
+  if (!sorted.length) {
+    el.className = 'hint';
+    el.innerHTML = 'No scores yet. Log one and it appears here.';
+    return;
+  }
+  el.className = '';
+  const W = 660, H = 240, L = 38, R = 14, T = 14, B = 30;
+  const times = sorted.map(sDateValue);
+  const valid = times.filter((t) => t !== null);
+  let t0 = 0, t1 = Math.max(1, sorted.length - 1);
+  if (valid.length >= 2) {
+    const lo = Math.min.apply(null, valid), hi = Math.max.apply(null, valid);
+    if (lo !== hi) { t0 = lo; t1 = hi; }
+  }
+  const xOf = (i) => {
+    const v = times[i] === null ? i : times[i];
+    return L + ((v - t0) / (t1 - t0)) * (W - L - R);
+  };
+  const yOf = (pct) => T + (1 - Math.max(0, Math.min(100, pct)) / 100) * (H - T - B);
+
+  const parts = [];
+  parts.push('<svg class="schart" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="Score over time">');
+  for (const mark of [0, 25, 50, 75, 100]) {
+    const y = yOf(mark);
+    parts.push('<line class="grid" x1="' + L + '" y1="' + y + '" x2="' + (W - R) + '" y2="' + y + '"></line>');
+    parts.push('<text class="axis" x="' + (L - 6) + '" y="' + (y + 3) + '" text-anchor="end">' + mark + '</text>');
+  }
+
+  const pts = sorted.map((s, i) => xOf(i).toFixed(1) + ',' + yOf(s.pct).toFixed(1)).join(' ');
+  parts.push('<polyline class="line" points="' + pts + '"></polyline>');
+
+  // Trailing average of the last three scores, which is the honest trend line.
+  const avg = sorted.map((s, i) => {
+    const slice = sorted.slice(Math.max(0, i - 2), i + 1);
+    return slice.reduce((a, x) => a + x.pct, 0) / slice.length;
+  });
+  if (sorted.length >= 2) {
+    parts.push('<polyline class="avg" points="' +
+      avg.map((v, i) => xOf(i).toFixed(1) + ',' + yOf(v).toFixed(1)).join(' ') + '"></polyline>');
+  }
+
+  sorted.forEach((s, i) => {
+    parts.push('<circle class="dot" cx="' + xOf(i).toFixed(1) + '" cy="' + yOf(s.pct).toFixed(1) +
+      '" r="4"><title>' + (s.date || '') + ' · ' + (s.label || s.unit || 'paper') + ' · ' +
+      s.pct + '%</title></circle>');
+  });
+
+  const first = sorted[0], last = sorted[sorted.length - 1];
+  parts.push('<text class="axis" x="' + L + '" y="' + (H - 8) + '">' + (first.date || '') + '</text>');
+  if (sorted.length > 1) {
+    parts.push('<text class="axis" x="' + (W - R) + '" y="' + (H - 8) + '" text-anchor="end">' + (last.date || '') + '</text>');
+  }
+  parts.push('</svg>');
+  el.innerHTML = parts.join('');
+}
+
+function sRender() {
+  const sorted = SCORES.slice().sort((a, b) =>
+    String(a.date || '').localeCompare(String(b.date || '')));
+  sRenderChart(sorted);
+
+  const avgs = $('s-avgs');
+  if (!sorted.length) { avgs.innerHTML = ''; }
+  else {
+    const last = sorted[sorted.length - 1];
+    const recent = sorted.slice(-3);
+    const recentAvg = recent.reduce((a, s) => a + s.pct, 0) / recent.length;
+    const best = sorted.reduce((a, s) => (s.pct > a.pct ? s : a), sorted[0]);
+    const firstAvg = sorted.slice(0, 3).reduce((a, s) => a + s.pct, 0) / Math.min(3, sorted.length);
+    const trend = recentAvg - firstAvg;
+    avgs.innerHTML =
+      '<span>last <b>' + last.pct + '%</b></span>' +
+      '<span>last 3 avg <b>' + recentAvg.toFixed(1) + '%</b></span>' +
+      '<span>best <b>' + best.pct + '%</b></span>' +
+      '<span>since start <b>' + (trend >= 0 ? '+' : '') + trend.toFixed(1) + '</b></span>';
+  }
+
+  const list = $('s-list');
+  if (!sorted.length) { list.innerHTML = ''; return; }
+  list.innerHTML = sorted.slice().reverse().map((s) =>
+    '<div class="srow"><span class="d">' + (s.date || '—') + '</span>' +
+    '<span class="p">' + (s.label || s.unit || 'paper') + '</span>' +
+    '<span>' + s.pct + '%</span>' +
+    '<button class="x" data-score="' + s.id + '" title="Delete">✕</button></div>').join('');
+  list.querySelectorAll('[data-score]').forEach((b) => b.addEventListener('click', () => sDelete(b.dataset.score)));
+}
+
+async function sLoad() {
+  try { SCORES = (await json('/api/scores')).scores || []; } catch (e) { SCORES = []; }
+  sFillSubject();
+  sRender();
+  sPaperOptions();
+}
+
+async function sDelete(id) {
+  const r = await json('/api/scores', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ action: 'delete', id })
+  });
+  if (r.ok) { SCORES = r.scores; sRender(); }
+}
+
+$('s-add').addEventListener('click', async () => {
+  const st = $('s-status');
+  const raw = Number($('s-raw').value);
+  const total = Number($('s-total').value);
+  const date = $('s-date').value || isoDay(new Date());
+  if (!(total > 0)) { st.className = 'status err'; st.textContent = 'Put in the total marks for the paper.'; return; }
+  if (!(raw >= 0) || raw > total) { st.className = 'status err'; st.textContent = 'The mark has to be between 0 and the total.'; return; }
+
+  const label = $('s-label').value.trim();
+  const body = {
+    action: 'add', date, label,
+    subject: $('s-subject').value,
+    unit: (label.split('·')[0] || '').trim(),
+    raw, total
+  };
+  try {
+    const r = await json('/api/scores', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
+    });
+    if (!r.ok) throw new Error(r.error || 'could not save');
+    SCORES = r.scores;
+    st.className = 'status ok';
+    st.textContent = 'Logged ' + raw + '/' + total + ' (' + Math.round(raw * 1000 / total) / 10 + '%).';
+    $('s-raw').value = ''; $('s-total').value = ''; $('s-label').value = '';
+    sRender();
+  } catch (e) {
+    st.className = 'status err';
+    st.textContent = String(e.message || e);
+  }
+});
+
+$('s-date').value = isoDay(new Date());
 
 </script>
 </body>
@@ -1274,6 +1861,8 @@ def _scan_ondisk():
         if os.path.isdir(d):
             n = size = 0
             for dirpath, _, files in os.walk(d):
+                if os.path.basename(dirpath) == SPEC_DIR:
+                    continue  # a spec is not a past paper, do not count it here
                 for f in files:
                     if f.lower().endswith(".pdf"):
                         n += 1
@@ -1368,6 +1957,160 @@ def _planner_catalogue(subject, refresh=False):
     return result
 
 
+# ------------------------- specifications -------------------------
+# The discovery rules live in ial.py so the CLI uses the same ones. web.py owns
+# the cache, the folder layout and the download.
+_SPEC_CACHE = {}
+
+
+def _spec_docs(subject):
+    """Specification PDFs for one subject, best first."""
+    try:
+        return ial.spec_docs(subject), ""
+    except Exception as exc:  # offline, blocked, rate limited
+        return [], "Could not reach Pearson (%s)." % type(exc).__name__
+
+
+def _spec_on_disk(subject=None):
+    """Specification PDFs already saved, as paths relative to papers/."""
+    if not os.path.isdir(OUT_ROOT):
+        return []
+    names = [subject] if subject else sorted(os.listdir(OUT_ROOT))
+    out = []
+    for name in names:
+        folder = os.path.join(OUT_ROOT, name, SPEC_DIR)
+        if not os.path.isdir(folder):
+            continue
+        for fn in sorted(os.listdir(folder)):
+            if not fn.lower().endswith(".pdf"):
+                continue
+            full = os.path.join(folder, fn)
+            try:
+                size = round(os.path.getsize(full) / 1e6, 2)
+            except OSError:
+                size = 0
+            out.append({"subject": name, "filename": fn, "size_mb": size,
+                        "path": "%s/%s/%s" % (name, SPEC_DIR, fn)})
+    return out
+
+
+def _spec_candidates(subject, refresh=False):
+    if not refresh and subject in _SPEC_CACHE:
+        return _SPEC_CACHE[subject]
+    docs, error = _spec_docs(subject)
+    chosen = next((d for d in docs if not d["odd"]), docs[0] if docs else None)
+    result = {
+        "subject": subject,
+        "chosen": chosen,
+        "others": [d for d in docs if d is not chosen],
+        "error": error,
+        "on_disk": _spec_on_disk(subject),
+    }
+    _SPEC_CACHE[subject] = result
+    return result
+
+
+def _download_spec(subject, doc):
+    """Fetch one spec PDF into papers/<Subject>/_Specification/."""
+    folder = os.path.join(OUT_ROOT, subject, SPEC_DIR)
+    os.makedirs(folder, exist_ok=True)
+    name = ial.spec_filename(subject, doc)
+    dest = os.path.join(folder, name)
+    rel = "%s/%s/%s" % (subject, SPEC_DIR, name)
+    if os.path.exists(dest) and os.path.getsize(dest) > 0:
+        return {"ok": True, "path": rel, "skipped": True}
+
+    url = ial.DOWNLOAD_BASE + urllib.parse.quote(doc["url"], safe="/-_.%")
+    req = urllib.request.Request(url, headers={"User-Agent": ial.USER_AGENT})
+    tmp = dest + ".part"
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r, open(tmp, "wb") as f:
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                f.write(chunk)
+        with open(tmp, "rb") as f:
+            if not f.read(8).startswith(b"%PDF"):
+                raise ValueError("Pearson did not return a PDF")
+        os.replace(tmp, dest)
+    except Exception as exc:  # noqa: BLE001
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        return {"ok": False, "error": "%s: %s" % (type(exc).__name__, exc)}
+    return {"ok": True, "path": rel, "skipped": False}
+
+
+def _get_scores():
+    data = _load_json(SCORES_FILE, {"scores": []})
+    if not isinstance(data.get("scores"), list):
+        data = {"scores": []}
+    return data
+
+
+# ------------------------- exam timetables -------------------------
+# Pearson publishes the IAL timetable as an xlsx per series. One scrape of the
+# timetables page finds them, then the parsed rows are cached for the session.
+_TT_SERIES = {"series": None}
+_TT_ROWS = {}
+
+
+def _tt_series(refresh=False):
+    if refresh or _TT_SERIES["series"] is None:
+        try:
+            _TT_SERIES["series"] = ial.timetable_series()
+        except Exception:  # offline, blocked
+            _TT_SERIES["series"] = _TT_SERIES["series"] or []
+    return _TT_SERIES["series"]
+
+
+def _tt_next(series):
+    """The first series that has not already happened, else the last one listed."""
+    today = date.today()
+    for s in series:
+        if (s["year"], s["month"]) >= (today.year, today.month):
+            return s
+    return series[-1] if series else None
+
+
+def _tt_sittings(url):
+    if url not in _TT_ROWS:
+        _TT_ROWS[url] = ial.exam_dates([], url)
+    return _TT_ROWS[url]
+
+
+def _timetable(units, series_file, refresh=False):
+    series = _tt_series(refresh=refresh)
+    if not series:
+        return {"series": [], "picked": None, "papers": [], "error":
+                "Could not read Pearson's timetable page."}
+    picked = next((s for s in series if s["file"] == series_file), None) or _tt_next(series)
+    out = {
+        "series": [{"label": s["label"], "file": s["file"]} for s in series],
+        "picked": {"label": picked["label"], "file": picked["file"]},
+        "papers": [],
+        "first": "",
+        "last": "",
+        "error": "",
+    }
+    if not units:
+        return out
+    try:
+        sittings = _tt_sittings(picked["url"])
+    except Exception as exc:  # noqa: BLE001
+        out["error"] = "Could not read the %s timetable (%s)." % (
+            picked["label"], type(exc).__name__)
+        return out
+    want = {u.upper() for u in units}
+    papers = [p for p in sittings if p["unit"] in want]
+    papers.sort(key=lambda p: (p["date"], p["unit"]))
+    out["papers"] = papers
+    if papers:
+        out["first"] = papers[0]["date"]
+        out["last"] = papers[-1]["date"]
+    return out
+
+
 def _list_files():
     out = []
     if not os.path.isdir(OUT_ROOT):
@@ -1378,6 +2121,8 @@ def _list_files():
                 full = os.path.join(dirpath, fn)
                 rel = os.path.relpath(full, OUT_ROOT).replace(os.sep, "/")
                 parts = rel.split("/")
+                if SPEC_DIR in parts[:2]:
+                    continue  # the spec is not a paper and stays out of the grid
                 subject = parts[0] if parts else ""
                 if subject == "Grade-boundaries":
                     unit, session = "", (parts[1] if len(parts) > 1 else "")
@@ -1529,7 +2274,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(data)
             return
         if path == "/api/subjects":
-            _send_json(self, ial.subjects_with_counts())
+            _send_json(self, ial.subject_menu())
             return
         if path == "/api/units":
             subject = qs.get("subject", [""])[0]
@@ -1570,6 +2315,44 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/planner/state":
             _send_json(self, _load_json(PLAN_FILE, {"config": {}, "done": {}}))
+            return
+        if path == "/api/spec":
+            subject = qs.get("subject", [""])[0]
+            if not subject:
+                _send_json(self, {"error": "subject required"}, 400)
+                return
+            refresh = qs.get("refresh", [""])[0] in ("1", "true", "yes")
+            _send_json(self, _spec_candidates(subject, refresh=refresh))
+            return
+        if path == "/api/pdf":
+            rel = qs.get("path", [""])[0]
+            full = os.path.realpath(os.path.join(OUT_ROOT, rel))
+            root = os.path.realpath(OUT_ROOT)
+            if not rel or not full.startswith(root + os.sep) or not os.path.isfile(full):
+                _send_json(self, {"error": "not found"}, 404)
+                return
+            try:
+                with open(full, "rb") as f:
+                    data = f.read()
+            except OSError:
+                _send_json(self, {"error": "unreadable"}, 500)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/pdf")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Content-Disposition",
+                             'inline; filename="%s"' % os.path.basename(full))
+            self.end_headers()
+            self.wfile.write(data)
+            return
+        if path == "/api/scores":
+            _send_json(self, _get_scores())
+            return
+        if path == "/api/timetable":
+            units = [u.strip() for u in qs.get("units", [""])[0].split(",") if u.strip()]
+            series = qs.get("series", [""])[0]
+            refresh = qs.get("refresh", [""])[0] in ("1", "true", "yes")
+            _send_json(self, _timetable(units, series, refresh=refresh))
             return
         if path == "/api/status":
             job_id = qs.get("id", [""])[0]
@@ -1639,6 +2422,64 @@ class Handler(BaseHTTPRequestHandler):
             body.setdefault("done", {})
             _save_json(PLAN_FILE, body)
             _send_json(self, {"saved": True})
+            return
+        if self.path == "/api/spec":
+            subject = body.get("subject") or ""
+            if not subject:
+                _send_json(self, {"ok": False, "error": "subject required"}, 400)
+                return
+            candidates = _spec_candidates(subject)
+            pool = ([candidates["chosen"]] if candidates["chosen"] else []) \
+                + candidates["others"]
+            doc = next((d for d in pool if d and d["url"] == body.get("url")), None)
+            if doc is None:
+                # The UI may send a url that came from an earlier session. Rebuild
+                # just enough of the record to name the file sensibly.
+                if not body.get("url"):
+                    _send_json(self, {"ok": False, "error": "no specification url"}, 400)
+                    return
+                m = ial._SPEC_VERSION_RE.search(body["url"])
+                doc = {"url": body["url"], "title": body.get("title") or "",
+                       "kind": "spec", "version": int(m.group(1)) if m else 0,
+                       "issue": 0, "odd": False}
+            result = _download_spec(subject, doc)
+            _SPEC_CACHE.pop(subject, None)
+            _send_json(self, result)
+            return
+        if self.path == "/api/scores":
+            data = _get_scores()
+            action = body.get("action") or "add"
+            scores = data["scores"]
+            if action == "add":
+                try:
+                    raw = float(body.get("raw"))
+                    total = float(body.get("total"))
+                except (TypeError, ValueError):
+                    _send_json(self, {"ok": False, "error": "marks must be numbers"}, 400)
+                    return
+                if total <= 0 or raw < 0 or raw > total:
+                    _send_json(self, {"ok": False,
+                                      "error": "raw marks have to be between 0 and the total"},
+                               400)
+                    return
+                entry = {
+                    "id": body.get("id") or str(int(time.time() * 1000)),
+                    "date": body.get("date") or "",
+                    "subject": body.get("subject") or "",
+                    "unit": body.get("unit") or "",
+                    "label": body.get("label") or "",
+                    "raw": raw,
+                    "total": total,
+                    "pct": round(raw * 100.0 / total, 1),
+                }
+                scores.append(entry)
+            elif action == "delete":
+                data["scores"] = scores = [s for s in scores if s.get("id") != body.get("id")]
+            else:
+                _send_json(self, {"ok": False, "error": "unknown action"}, 400)
+                return
+            _save_json(SCORES_FILE, data)
+            _send_json(self, {"ok": True, "scores": scores})
             return
         if self.path == "/api/settings":
             s = body

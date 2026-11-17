@@ -1,26 +1,35 @@
-"""ial-papers: bulk-download Edexcel IAL past papers + mark schemes from Pearson.
+"""ial-papers: Edexcel IAL papers, specifications and exam dates from Pearson.
 
 Talks to Pearson's public Algolia search index (the same one their past-papers
 page uses in the browser) to discover every IAL document, then downloads the
-PDFs straight from qualifications.pearson.com's DAM.
+PDFs straight from qualifications.pearson.com's DAM. Specifications come from the
+same index. Exam timetables are published as xlsx files on Pearson's timetable
+page, so those are read with zipfile and ElementTree rather than a library.
 
 Stdlib-only. Usage examples:
 
     python3 cli.py subjects
     python3 cli.py units Mathematics
     python3 cli.py download --subject Mathematics --unit WMA11 --years 2022-2025
+    python3 cli.py spec Biology --download
+    python3 cli.py dates WBI14 WBI15 --series summer-2027
     python3 cli.py sync
 
 Output tree:
 
     papers/Mathematics/WMA11-P1/Jan 2024/WMA11-P1_Jan2024_qp.pdf
+    papers/Biology/_Specification/IAL-Biology-Specification-2018.pdf
     papers/manifest.json
 """
 
+import io
 import json
 import re
 import urllib.parse
 import urllib.request
+import zipfile
+from datetime import date, timedelta
+from xml.etree import ElementTree as ET
 
 APP_ID = "L639T95U5A"
 API_KEY = "f79c7a8352e9ffbdaec387bf43612ee6"
@@ -43,6 +52,8 @@ TYPE_SHORT = {
     "Listening-Examinations-MP3": "mp3",
     "Scientific-article": "sa",
     "Advance-information-and-Pre-release-material": "ai",
+    "Specification": "spec",
+    "Specification-addendum": "spec-add",
 }
 
 # Pearson's index is inconsistent about casing ("Mark-scheme" vs "Mark-Scheme").
@@ -300,6 +311,71 @@ def subjects_with_counts(doc_types=None):
     return dict(sorted(out.items()))
 
 
+# Pearson's IAL index carries language qualifications and retired variants of
+# subjects we already have. Left alone, the subject dropdown offers Biology,
+# Biology-A, Biology-B, Biology-(Human) and Biology-A-(Salters-Nuffield), four of
+# which have almost nothing behind them. One entry per real subject is the point.
+LANGUAGE_SUBJECTS = {
+    "Arabic", "Arabic-as-a-first-language", "Bangla", "Chinese", "French",
+    "German", "Greek", "Greek-as-a-first-language", "Gujarati", "Italian",
+    "Japanese", "Persian", "Portuguese", "Russian", "Sinhala", "Spanish",
+    "Swahili", "Tamil", "Turkish", "Urdu",
+    "English-(as-2nd-language)", "English-as-a-Second-Language-(ESL)",
+}
+
+# Variants that do not strip down to a base name on their own.
+SUBJECT_ALIASES = {"Business-Studies": "Business"}
+
+
+def root_subject(name):
+    """Chase -A, -B and -(Bracketed) suffixes back to the base subject name.
+
+    Biology-A-(Salters-Nuffield) -> Biology-A -> Biology. A name ending in a
+    multi letter tag such as Applied-ICT is left alone.
+    """
+    n = name or ""
+    while True:
+        stripped = re.sub(r"-\([^)]*\)$", "", n)
+        if stripped == n:
+            stripped = re.sub(r"-[A-Z]$", "", n)
+        if stripped == n:
+            return n
+        n = stripped
+
+
+def subject_menu():
+    """Subjects worth showing, mapped to how many question papers each has.
+
+    Variants are merged into their base and languages are dropped. A subject stays
+    if it has question papers or a specification, so a brand new spec (Computer
+    Science 2026) is still reachable. News feeds and update pages drop out.
+    """
+    papers = subjects_with_counts(doc_types=["Question-paper"])
+    specs = subjects_with_counts(doc_types=["Specification",
+                                            "Specification-addendum"])
+    totals = subjects_with_counts()
+
+    def resolve(name):
+        root = root_subject(name)
+        return SUBJECT_ALIASES.get(root, root)
+
+    def merged_counts(source):
+        out = {}
+        for name, n in source.items():
+            key = resolve(name)
+            if key in LANGUAGE_SUBJECTS:
+                continue
+            out[key] = out.get(key, 0) + n
+        return out
+
+    paper_counts = merged_counts(papers)
+    present = set(paper_counts) | set(merged_counts(specs))
+    # Keep only roots that exist as a subject in their own right. Biology-(Human)
+    # merges into Biology because Biology is there. A stray root with no base is not.
+    known = {resolve(n) for n in totals}
+    return dict(sorted((k, paper_counts.get(k, 0)) for k in present if k in known))
+
+
 def list_units(papers):
     """Group papers by unit code -> (label, subject, n_qp, n_ms, n_er)."""
     units = {}
@@ -339,6 +415,190 @@ def filter_papers(papers, unit=None, years=None, sessions=None, types=None):
         if types and p.type_short not in types:
             continue
         out.append(p)
+    return out
+
+
+# ------------------------- specifications -------------------------
+
+# Pearson files a few things under "Specification" that are not the spec itself:
+# errata, cover letters, appendices, the old paper syllabus. They are still
+# returned, ranked last, so the plain spec wins the default pick.
+_SPEC_ODD_RE = re.compile(
+    r"erratum|cover letter|prescribed text|appendix|qualification outline"
+    r"|syllabus|poem|addendum", re.I)
+_SPEC_VERSION_RE = re.compile(r"/(\d{4})/")
+_SPEC_ISSUE_RE = re.compile(r"(?:issue|iss)\s*[-_ ]?(\d+)", re.I)
+
+
+def spec_docs(subject=None):
+    """Specification PDFs, best first. Specs have no unit code and no exam
+    session, which is why they never go through the paper pipeline."""
+    types = (doc_type_variants("spec") or ["Specification"]) + \
+            (doc_type_variants("spec-add") or ["Specification-addendum"])
+    out = []
+    for d in fetch_all(doc_types=types, subjects=[subject] if subject else None):
+        if d.type_short not in ("spec", "spec-add"):
+            continue
+        version = 0
+        m = _SPEC_VERSION_RE.search(d.url or "")
+        if m:
+            version = int(m.group(1))
+        issue = 0
+        hay = "%s %s" % (d.title or "", (d.url or "").rsplit("/", 1)[-1])
+        im = _SPEC_ISSUE_RE.search(hay)
+        if im:
+            issue = int(im.group(1))
+        out.append({
+            "title": d.title or "Specification",
+            "url": d.url or "",
+            "kind": d.type_short,
+            "version": version,
+            "issue": issue,
+            "odd": bool(_SPEC_ODD_RE.search(d.title or "")),
+        })
+    out.sort(key=lambda x: (x["odd"], x["kind"] != "spec",
+                            -x["version"], -x["issue"]))
+    return out
+
+
+def spec_filename(subject, doc):
+    """Deterministic name, so asking twice is a no-op rather than a duplicate."""
+    bits = ["IAL", (subject or "Subject").replace(" ", "-"), "Specification"]
+    if doc.get("version"):
+        bits.append(str(doc["version"]))
+    if doc.get("issue"):
+        bits.append("issue%d" % doc["issue"])
+    return "-".join(bits) + ".pdf"
+
+
+# ------------------------- exam timetables -------------------------
+
+TIMETABLE_PAGE = ("https://qualifications.pearson.com/en/support/"
+                  "support-topics/exams/exam-timetables.html")
+_SERIES_DIR = "Examination-timetables-for-International-Advanced-Levels"
+_SERIES_MONTH = {"january": 1, "february": 2, "march": 3, "spring": 4,
+                 "summer": 6, "june": 6, "october": 10, "november": 11}
+_EXCEL_EPOCH = date(1899, 12, 30)
+_SS = "{http://schemas.openxmlformats.org/spreadsheetml/2006/main}"
+
+
+def _fetch(url, timeout=60):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def _excel_date(value):
+    """Excel stores dates as days since 1899-12-30."""
+    try:
+        n = float(value)
+    except (TypeError, ValueError):
+        return ""
+    if not (30000 < n < 80000):
+        return ""
+    return (_EXCEL_EPOCH + timedelta(days=int(n))).isoformat()
+
+
+def _sheet_target(z, sheet_name):
+    wb = z.read("xl/workbook.xml").decode("utf-8", "replace")
+    rels = z.read("xl/_rels/workbook.xml.rels").decode("utf-8", "replace")
+    targets = dict(re.findall(r'Id="([^"]+)"[^>]*Target="([^"]+)"', rels))
+    for name, rid in re.findall(r'<sheet[^>]*name="([^"]+)"[^>]*r:id="([^"]+)"', wb):
+        if name == sheet_name:
+            t = targets.get(rid, "")
+            return t if t.startswith("xl/") else "xl/" + t.lstrip("/")
+    return ""
+
+
+def parse_timetable(data, sheet_name="All papers"):
+    """Rows of a Pearson timetable xlsx as dicts keyed by the header names.
+
+    An xlsx is a zip of xml, so zipfile and ElementTree do the whole job with no
+    dependency. Pearson put one sheet called "All papers" in these files with the
+    date, the examination code and the sitting time, which is all the planner needs.
+    """
+    z = zipfile.ZipFile(io.BytesIO(data))
+    target = _sheet_target(z, sheet_name)
+    if not target:
+        return []
+    try:
+        shared = ["".join(t.text or "" for t in si.iter(_SS + "t"))
+                  for si in ET.fromstring(z.read("xl/sharedStrings.xml")).iter(_SS + "si")]
+    except KeyError:
+        shared = []
+
+    rows, header = [], None
+    for row in ET.fromstring(z.read(target)).iter(_SS + "row"):
+        cells = {}
+        for c in row.iter(_SS + "c"):
+            ref = c.get("r") or ""
+            m = re.match(r"[A-Z]+", ref)
+            if not m:
+                continue
+            kind, v, inline = c.get("t"), c.find(_SS + "v"), c.find(_SS + "is")
+            if kind == "s" and v is not None:
+                val = shared[int(v.text)]
+            elif kind == "inlineStr" and inline is not None:
+                val = "".join(t.text or "" for t in inline.iter(_SS + "t"))
+            elif v is not None:
+                val = v.text or ""
+            else:
+                val = ""
+            cells[m.group(0)] = val.strip()
+        if not cells:
+            continue
+        if header is None:
+            if "Date" in cells.values():
+                header = cells
+            continue
+        rows.append({header[k]: v for k, v in cells.items() if k in header})
+    for r in rows:
+        r["Date"] = _excel_date(r.get("Date"))
+    return rows
+
+
+def timetable_series():
+    """The IAL final timetables Pearson publishes, oldest series first."""
+    html = _fetch(TIMETABLE_PAGE).decode("utf-8", "replace")
+    pattern = r"/content/dam/pdf/Support/%s/([A-Za-z0-9._-]+\.xlsx)" % _SERIES_DIR
+    out, seen = [], set()
+    for fn in re.findall(pattern, html):
+        m = re.match(r"ial-([a-z]+)-?(\d{4})-final", fn, re.I)
+        if not m or fn in seen:
+            continue
+        seen.add(fn)
+        word = m.group(1).lower()
+        out.append({
+            "file": fn,
+            "label": "%s %s" % (word.title(), m.group(2)),
+            "month": _SERIES_MONTH.get(word, 0),
+            "year": int(m.group(2)),
+            "url": "%s/content/dam/pdf/Support/%s/%s" % (DOWNLOAD_BASE, _SERIES_DIR, fn),
+        })
+    out.sort(key=lambda s: (s["year"], s["month"], s["label"]))
+    return out
+
+
+def exam_dates(units, url):
+    """Exam sittings for the given unit codes in one series, in date order."""
+    want = {u.upper() for u in units if u}
+    out = []
+    for row in parse_timetable(_fetch(url)):
+        code = (row.get("Examination code") or "").upper().strip()
+        unit = code.split()[0] if code else ""
+        if not unit or not row.get("Date"):
+            continue  # section headers and blank filler rows
+        if want and unit not in want:
+            continue
+        out.append({
+            "unit": unit,
+            "subject": row.get("Subject") or "",
+            "title": row.get("Title") or "",
+            "date": row.get("Date") or "",
+            "time": row.get("Time") or "",
+            "duration": row.get("Duration") or "",
+        })
+    out.sort(key=lambda e: (e["date"], e["unit"]))
     return out
 
 
